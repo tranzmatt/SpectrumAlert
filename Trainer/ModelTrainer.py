@@ -3,18 +3,25 @@ import numpy as np
 from sklearn.ensemble import IsolationForest
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report
-import joblib  # Used to save the model
+import joblib
+import os
+import csv
 
-# Function to load the collected IQ data from the JSON file
-def load_data_from_file(filename):
+# Function to handle loading CSV data into features and frequencies
+def load_data_from_csv(filename):
+    if not os.path.exists(filename):
+        raise FileNotFoundError(f"File {filename} not found.")
+
+    frequencies = []
+    features = []
     with open(filename, 'r') as f:
-        data = json.load(f)
+        reader = csv.reader(f)
+        header = next(reader)  # Skip the header row
+        for row in reader:
+            frequencies.append(float(row[0]))
+            features.append([float(value) for value in row[1:]])
 
-    # Extract features and corresponding frequencies
-    features = np.array([entry['features'] for entry in data])
-    frequencies = np.array([entry['frequency'] for entry in data])
-
-    return features, frequencies
+    return np.array(features), np.array(frequencies)
 
 # Function to train the Isolation Forest anomaly detection model
 def train_anomaly_model(features):
@@ -54,10 +61,16 @@ def evaluate_model(X_train, X_test, y_pred_train, y_pred_test):
 
 # Main execution
 if __name__ == "__main__":
-    # Load the collected data from the JSON file
-    data_file = 'collected_iq_data.json'
+    # Load the collected data from the CSV file
+    data_file = 'collected_iq_data.csv'  # Updated path to the uploaded dataset
     print(f"Loading data from {data_file}...")
-    features, frequencies = load_data_from_file(data_file)
+
+    try:
+        features, frequencies = load_data_from_csv(data_file)
+        print(f"Sample features (first 5): {features[:5]}")  # Debugging statement
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        exit(1)
 
     # Train the anomaly detection model
     model, X_train, X_test, y_pred_train, y_pred_test = train_anomaly_model(features)

@@ -4,9 +4,10 @@ from rtlsdr import RtlSdr
 from sklearn.ensemble import IsolationForest
 import joblib
 import paho.mqtt.client as mqtt
+from scipy.signal import welch
 
 # Function to read and parse the config file
-def read_config(config_file='config.ini'):
+def read_config(config_file='Trainer/config.ini'):
     config = configparser.ConfigParser()
     config.read(config_file)
 
@@ -97,11 +98,10 @@ def monitor_spectrum(sdr, model, mqtt_client, ham_bands, freq_step, sample_rate,
 
                 if np.mean(run_anomalies) > 0:
                     freq_mhz = current_freq / 1e6
-                    mqtt_client.publish(mqtt_topics['anomalies'], f"{freq_mhz:.2f} MHz")
-                    mqtt_client.publish(mqtt_topics['modulation'], modulation_type)
-                    mqtt_client.publish(mqtt_topics['signal_strength'], f"{signal_strength_db:.2f} dB")
+                    mqtt_client.publish(mqtt_topics['anomalies'], freq_mhz)
+                    mqtt_client.publish(mqtt_topics['modulation'],f"{modulation_type}")
+                    mqtt_client.publish(mqtt_topics['signal_strength'], f"{signal_strength_db:.2f}")
                     mqtt_client.publish(mqtt_topics['coordinates'], f"Latitude: {receiver_lat}, Longitude: {receiver_lon}")
-
                     print(f"Anomaly detected at {freq_mhz:.2f} MHz with {modulation_type} modulation, Signal Strength: {signal_strength_db:.2f} dB")
                 
                 current_freq += freq_step
@@ -135,7 +135,6 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
         print("Monitoring stopped by user.")
-    finally:
         sdr.close()
         mqtt_client.disconnect()
         print("Closed SDR device and disconnected from MQTT.")
