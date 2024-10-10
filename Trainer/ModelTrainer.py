@@ -1,82 +1,105 @@
 import json
 import numpy as np
-from sklearn.ensemble import IsolationForest
-from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier, IsolationForest
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
 from sklearn.metrics import accuracy_score, classification_report
+from sklearn.cluster import DBSCAN
 import joblib
 import os
 import csv
 
-# Function to handle loading CSV data into features and frequencies
+# Function to handle loading CSV data into features
 def load_data_from_csv(filename):
     if not os.path.exists(filename):
         raise FileNotFoundError(f"File {filename} not found.")
 
-    frequencies = []
     features = []
     with open(filename, 'r') as f:
         reader = csv.reader(f)
         header = next(reader)  # Skip the header row
         for row in reader:
-            frequencies.append(float(row[0]))
             features.append([float(value) for value in row[1:]])
 
-    return np.array(features), np.array(frequencies)
+    return np.array(features)
 
-# Function to train the Isolation Forest anomaly detection model
-def train_anomaly_model(features):
+# Function to train an RF fingerprinting model and anomaly detection model
+def train_rf_fingerprinting_model(features):
     # Splitting data into training and testing sets
+    if len(features) < 2:
+        print("Not enough data to train the model.")
+        return None, None
+
     X_train, X_test = train_test_split(features, test_size=0.2, random_state=42)
 
-    # Initializing the IsolationForest model
-    model = IsolationForest(contamination=0.01, random_state=42)
+    # Initializing the RandomForestClassifier model
+    model = RandomForestClassifier(random_state=42)
+
+    # Setting up hyperparameter tuning with GridSearchCV
+    param_grid = {
+        'n_estimators': [50, 100, 150],
+        'max_depth': [None, 10, 20, 30],
+        'min_samples_split': [2, 5, 10],
+        'min_samples_leaf': [1, 2, 4]
+    }
+    grid_search = GridSearchCV(estimator=model, param_grid=param_grid, cv=5, n_jobs=-1, verbose=2)
 
     # Train the model on the training data
-    print("Training the Isolation Forest model...")
-    model.fit(X_train)
+    print("Training the RF fingerprinting model with hyperparameter tuning...")
+    labels = [f"Device_{i % 10}" for i in range(len(X_train))]  # Use generated labels to simulate multiple devices
+    grid_search.fit(X_train, labels)
 
-    # Use the trained model to predict anomalies on the test set
-    y_pred_train = model.predict(X_train)
-    y_pred_test = model.predict(X_test)
+    # Best model from grid search
+    best_model = grid_search.best_estimator_
+    print(f"Best parameters found: {grid_search.best_params_}")
 
-    # Since IsolationForest returns -1 for anomalies and 1 for normal data, let's convert to binary
-    y_pred_train = np.where(y_pred_train == 1, 0, 1)  # 0: normal, 1: anomaly
-    y_pred_test = np.where(y_pred_test == 1, 0, 1)
+    # Evaluate the model on the test data
+    y_pred = best_model.predict(X_test)
+    y_test_labels = [f"Device_{i % 10}" for i in range(len(X_test))]  # Simulated labels for evaluation
+    print(f"Classification accuracy: {accuracy_score(y_test_labels, y_pred) * 100:.2f}%")
+    print("Classification Report:")
+    print(classification_report(y_test_labels, y_pred))
 
-    return model, X_train, X_test, y_pred_train, y_pred_test
+    # Cross-validation for more reliable performance evaluation
+    cv_labels = [f"Device_{i % 10}" for i in range(len(features))]  # Consistent labels for cross-validation
+    cv_scores = cross_val_score(best_model, features, cv_labels, cv=5)
+    print(f"Cross-validation scores: {cv_scores}")
+    print(f"Mean cross-validation score: {np.mean(cv_scores) * 100:.2f}%")
 
-# Function to save the trained model to a file
-def save_model_to_file(model, filename='anomaly_detection_model.pkl'):
+    # Train an IsolationForest model for anomaly detection
+    print("Training the IsolationForest model for anomaly detection...")
+    anomaly_detector = IsolationForest(contamination=0.05, random_state=42)
+    anomaly_detector.fit(features)
+    print("Anomaly detection model trained successfully.")
+
+    return best_model, anomaly_detector
+
+# Function to save the trained models to files
+def save_model_to_file(model, filename='rf_fingerprinting_model.pkl'):
     joblib.dump(model, filename)
     print(f"Model saved to {filename}")
 
-# Function to evaluate model performance
-def evaluate_model(X_train, X_test, y_pred_train, y_pred_test):
-    print("Training set evaluation:")
-    print(f"Train accuracy: {accuracy_score(np.zeros(len(X_train)), y_pred_train) * 100:.2f}%")
-    print("Testing set evaluation:")
-    print(f"Test accuracy: {accuracy_score(np.zeros(len(X_test)), y_pred_test) * 100:.2f}%")
-    print("\nClassification report (on test set):")
-    print(classification_report(np.zeros(len(X_test)), y_pred_test, target_names=["Normal", "Anomaly"]))
+def save_anomaly_model_to_file(model, filename='anomaly_detection_model.pkl'):
+    joblib.dump(model, filename)
+    print(f"Anomaly detection model saved to {filename}")
 
 # Main execution
 if __name__ == "__main__":
     # Load the collected data from the CSV file
-    data_file = 'collected_iq_data.csv'  # Updated path to the uploaded dataset
+    data_file = 'collected_iq_data.csv'
     print(f"Loading data from {data_file}...")
 
     try:
-        features, frequencies = load_data_from_csv(data_file)
+        features = load_data_from_csv(data_file)
         print(f"Sample features (first 5): {features[:5]}")  # Debugging statement
     except Exception as e:
         print(f"Error loading data: {e}")
         exit(1)
 
-    # Train the anomaly detection model
-    model, X_train, X_test, y_pred_train, y_pred_test = train_anomaly_model(features)
+    # Train the RF fingerprinting and anomaly detection models
+    model, anomaly_model = train_rf_fingerprinting_model(features)
 
-    # Evaluate the model
-    evaluate_model(X_train, X_test, y_pred_train, y_pred_test)
-
-    # Save the trained model to a file for future use
-    save_model_to_file(model)
+    # Save the trained models to files for future use
+    if model is not None:
+        save_model_to_file(model, 'rf_fingerprinting_model.pkl')
+    if anomaly_model is not None:
+        save_anomaly_model_to_file(anomaly_model, 'anomaly_detection_model.pkl')

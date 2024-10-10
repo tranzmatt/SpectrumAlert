@@ -4,6 +4,7 @@ from rtlsdr import RtlSdr
 import os
 import csv
 import time
+from sklearn.ensemble import IsolationForest
 
 # Function to read and parse the config file
 def read_config(config_file='Trainer/config.ini'):
@@ -38,19 +39,49 @@ def read_config(config_file='Trainer/config.ini'):
 
     return ham_bands, freq_step, sample_rate, runs_per_freq
 
-# Function to extract features from IQ data
+# Function to extract enhanced features from IQ data for RF fingerprinting
 def extract_features(iq_data):
     I = np.real(iq_data)
     Q = np.imag(iq_data)
     amplitude = np.sqrt(I**2 + Q**2)
+    phase = np.unwrap(np.angle(iq_data))
+
+    # Basic features
     fft_values = np.fft.fft(iq_data)
     fft_magnitude = np.abs(fft_values)
-    return [np.mean(amplitude), np.std(amplitude), np.mean(fft_magnitude), np.std(fft_magnitude)]
+    mean_amplitude = np.mean(amplitude)
+    std_amplitude = np.std(amplitude)
+    mean_fft_magnitude = np.mean(fft_magnitude)
+    std_fft_magnitude = np.std(fft_magnitude)
+
+    # Higher-order statistics for RF fingerprinting
+    skew_amplitude = np.mean((amplitude - mean_amplitude) ** 3) / (std_amplitude ** 3)
+    kurt_amplitude = np.mean((amplitude - mean_amplitude) ** 4) / (std_amplitude ** 4)
+    skew_phase = np.mean((phase - np.mean(phase)) ** 3) / (np.std(phase) ** 3)
+    kurt_phase = np.mean((phase - np.mean(phase)) ** 4) / (np.std(phase) ** 4)
+
+    # Cyclostationary features (simplified)
+    cyclo_autocorr = np.abs(np.correlate(amplitude, amplitude, mode='full')[len(amplitude)//2:]).mean()
+
+    # Additional features for enrichment
+    spectral_entropy = -np.sum((fft_magnitude / np.sum(fft_magnitude)) * np.log2(fft_magnitude / np.sum(fft_magnitude) + 1e-12))
+    papr = np.max(amplitude) ** 2 / np.mean(amplitude ** 2)
+    band_energy_ratio = np.sum(fft_magnitude[:len(fft_magnitude)//2]) / np.sum(fft_magnitude)
+
+    return [
+        mean_amplitude, std_amplitude, mean_fft_magnitude, std_fft_magnitude,
+        skew_amplitude, kurt_amplitude, skew_phase, kurt_phase, cyclo_autocorr,
+        spectral_entropy, papr, band_energy_ratio
+    ]
 
 # Function to gather IQ data and extract features
 def gather_iq_data_continuous(sdr, ham_bands, freq_step, runs_per_freq, filename):
     header_written = False  # To ensure we write the CSV header only once
     start_time = time.time()
+
+    # Initialize IsolationForest for anomaly detection
+    anomaly_detector = IsolationForest(contamination=0.05, random_state=42)
+    collected_features = []
 
     while True:  # Infinite loop to gather data continuously
         for band_start, band_end in ham_bands:
@@ -59,15 +90,24 @@ def gather_iq_data_continuous(sdr, ham_bands, freq_step, runs_per_freq, filename
                 run_features = []
                 for _ in range(runs_per_freq):
                     sdr.center_freq = current_freq
-                    iq_samples = sdr.read_samples(128 * 1024)  # Read samples
+                    sdr.gain = adjust_gain(sdr)  # Adjust gain dynamically based on signal strength
+                    iq_samples = sdr.read_samples(256 * 1024)  # Increase the number of samples for better accuracy
                     features = extract_features(iq_samples)
                     run_features.append(features)
 
                 # Average over multiple runs
                 avg_features = np.mean(run_features, axis=0)
                 data = [current_freq] + avg_features.tolist()
+                collected_features.append(avg_features)
 
                 print(f"Collected data at {current_freq / 1e6:.2f} MHz")
+
+                # Detect anomalies if enough data has been collected
+                if len(collected_features) > 50:
+                    anomaly_detector.fit(collected_features)
+                    is_anomaly = anomaly_detector.predict([avg_features])[0] == -1
+                    if is_anomaly:
+                        print(f"Anomaly detected at {current_freq / 1e6:.2f} MHz with features: {avg_features}")
 
                 # Save the collected data to CSV
                 save_data_to_csv(data, filename, header_written)
@@ -81,6 +121,17 @@ def gather_iq_data_continuous(sdr, ham_bands, freq_step, runs_per_freq, filename
         if current_time - start_time > 60:
             start_time = current_time  # Reset timer
 
+# Function to dynamically adjust the SDR gain based on signal strength
+def adjust_gain(sdr):
+    # Adjust gain dynamically by evaluating signal power and choosing an optimal gain value
+    power = np.mean(np.abs(sdr.read_samples(1024)) ** 2)
+    if power < -40:
+        return 40  # Set to high gain if the signal is weak
+    elif power < -20:
+        return 20  # Set to moderate gain for medium strength signals
+    else:
+        return 10  # Set to low gain for strong signals
+
 # Function to save the collected data as a CSV
 def save_data_to_csv(data, filename, header_written):
     directory = os.path.dirname(filename)
@@ -93,7 +144,9 @@ def save_data_to_csv(data, filename, header_written):
     with open(filename, 'a', newline='') as f:
         writer = csv.writer(f)
         if not header_written:
-            writer.writerow(['Frequency', 'Mean_Amplitude', 'Std_Amplitude', 'Mean_FFT_Magnitude', 'Std_FFT_Magnitude'])
+            writer.writerow(['Frequency', 'Mean_Amplitude', 'Std_Amplitude', 'Mean_FFT_Magnitude', 'Std_FFT_Magnitude',
+                             'Skew_Amplitude', 'Kurt_Amplitude', 'Skew_Phase', 'Kurt_Phase', 'Cyclo_Autocorr',
+                             'Spectral_Entropy', 'PAPR', 'Band_Energy_Ratio'])
         writer.writerow(data)
     
     print(f"Data saved to {filename}")
@@ -108,7 +161,6 @@ if __name__ == "__main__":
         # Instantiate RTL-SDR
         sdr = RtlSdr()
         sdr.sample_rate = sample_rate
-        sdr.gain = 'auto'  # Automatic gain control
 
         # Start continuous IQ data collection
         print("Starting continuous IQ data collection...")

@@ -1,10 +1,11 @@
 import numpy as np
 import configparser
 from rtlsdr import RtlSdr
-from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import RandomForestClassifier, IsolationForest
 import joblib
 import paho.mqtt.client as mqtt
 from scipy.signal import welch
+import os
 
 # Function to read and parse the config file
 def read_config(config_file='Trainer/config.ini'):
@@ -40,77 +41,99 @@ def read_config(config_file='Trainer/config.ini'):
     return ham_bands, freq_step, sample_rate, runs_per_freq, receiver_lat, receiver_lon, mqtt_broker, mqtt_port, mqtt_topics
 
 # Function to load the pre-trained anomaly detection model
-def load_anomaly_model(model_file='anomaly_detection_model.pkl'):
-    model = joblib.load(model_file)
-    print(f"Model loaded from {model_file}")
+def load_anomaly_detection_model(model_file='anomaly_detection_model.pkl'):
+    if os.path.exists(model_file):
+        model = joblib.load(model_file)
+        print(f"Anomaly detection model loaded from {model_file}")
+    else:
+        model = IsolationForest(contamination=0.05, random_state=42)
+        print("No pre-trained anomaly model found. A new model will be created.")
     return model
 
-# Function to calculate signal strength in dB
-def calculate_signal_strength(iq_data):
-    power = np.mean(np.abs(iq_data) ** 2)
-    return 10 * np.log10(power)
+# Function to load the pre-trained RF fingerprinting model (placeholder)
+def load_rf_fingerprinting_model(model_file='rf_fingerprinting_model.pkl'):
+    if os.path.exists(model_file):
+        model = joblib.load(model_file)
+        print(f"RF fingerprinting model loaded from {model_file}")
+    else:
+        model = RandomForestClassifier()
+        print("No pre-trained RF fingerprinting model found. A new model will be created.")
+    return model
 
 # Function to extract features from IQ data
 def extract_features(iq_data):
     I = np.real(iq_data)
     Q = np.imag(iq_data)
     amplitude = np.sqrt(I**2 + Q**2)
+    phase = np.unwrap(np.angle(iq_data))
+
+    # Basic features
     fft_values = np.fft.fft(iq_data)
     fft_magnitude = np.abs(fft_values)
-    return [np.mean(amplitude), np.std(amplitude), np.mean(fft_magnitude), np.std(fft_magnitude)]
+    mean_amplitude = np.mean(amplitude)
+    std_amplitude = np.std(amplitude)
+    mean_fft_magnitude = np.mean(fft_magnitude)
+    std_fft_magnitude = np.std(fft_magnitude)
 
-# Function to detect modulation type
-def detect_modulation_type(iq_data, sample_rate):
+    # Higher-order statistics for RF fingerprinting
+    skew_amplitude = np.mean((amplitude - mean_amplitude) ** 3) / (std_amplitude ** 3)
+    kurt_amplitude = np.mean((amplitude - mean_amplitude) ** 4) / (std_amplitude ** 4)
+    skew_phase = np.mean((phase - np.mean(phase)) ** 3) / (np.std(phase) ** 3)
+    kurt_phase = np.mean((phase - np.mean(phase)) ** 4) / (np.std(phase) ** 4)
+
+    # Cyclostationary features (simplified)
+    cyclo_autocorr = np.abs(np.correlate(amplitude, amplitude, mode='full')[len(amplitude)//2:]).mean()
+
+    return [
+        mean_amplitude, std_amplitude, mean_fft_magnitude, std_fft_magnitude,
+        skew_amplitude, kurt_amplitude, skew_phase, kurt_phase, cyclo_autocorr
+    ]
+
+# Function to calculate signal strength (placeholder)
+def calculate_signal_strength(iq_data):
     amplitude = np.abs(iq_data)
-    phase = np.unwrap(np.angle(iq_data))
-    freq = np.diff(phase) / (2.0 * np.pi) * sample_rate
-    freqs, psd = welch(iq_data, fs=sample_rate, nperseg=1024, return_onesided=False)
-    if np.std(amplitude) > 0.1 and np.std(freq) < 0.05:
-        return "AM"
-    if np.std(freq) > 0.05 and np.std(amplitude) < 0.05:
-        return "FM"
-    if np.std(np.diff(phase)) > 0.1:
-        return "PM"
-    power_above_carrier = np.sum(psd[freqs > 0])
-    power_below_carrier = np.sum(psd[freqs < 0])
-    if power_above_carrier > 2 * power_below_carrier:
-        return "USB"
-    elif power_below_carrier > 2 * power_above_carrier:
-        return "LSB"
-    return "Unknown"
+    signal_strength_db = 10 * np.log10(np.mean(amplitude**2))
+    return signal_strength_db
+
+# MQTT client setup (placeholder)
+def setup_mqtt(broker, port):
+    client = mqtt.Client()
+    client.connect(broker, port, 60)
+    return client
 
 # Function to monitor the ham bands and publish anomalies to MQTT
-def monitor_spectrum(sdr, model, mqtt_client, ham_bands, freq_step, sample_rate, runs_per_freq, mqtt_topics, receiver_lat, receiver_lon):
+def monitor_spectrum(sdr, model, anomaly_model, mqtt_client, ham_bands, freq_step, sample_rate, runs_per_freq, mqtt_topics, receiver_lat, receiver_lon):
+    known_features = []
+    similarity_threshold = 0.3  # Threshold to consider a device as similar
+
     while True:
         for band_start, band_end in ham_bands:
             current_freq = band_start
             while current_freq <= band_end:
-                run_anomalies = []
                 for _ in range(runs_per_freq):
                     sdr.center_freq = current_freq
                     iq_samples = sdr.read_samples(128 * 1024)
                     features = extract_features(iq_samples)
-                    is_anomaly = model.predict([features]) == -1
-                    run_anomalies.append(is_anomaly)
+                    signal_strength_db = calculate_signal_strength(iq_samples)
 
-                modulation_type = detect_modulation_type(iq_samples, sample_rate)
-                signal_strength_db = calculate_signal_strength(iq_samples)
+                    # Detect anomalies
+                    is_anomaly = anomaly_model.predict([features])[0] == -1
+                    if is_anomaly:
+                        print(f"Anomaly detected at {current_freq / 1e6:.2f} MHz with features: {features}")
+                        mqtt_client.publish(mqtt_topics['anomalies'], f"Anomaly at {current_freq / 1e6:.2f} MHz")
 
-                if np.mean(run_anomalies) > 0:
+                    # Update the model with new data if known features exist
+                    if len(known_features) > 1:
+                        labels = ["Device" for _ in known_features]
+                        model.fit(known_features, labels)
+
+                    known_features.append(features)
                     freq_mhz = current_freq / 1e6
-                    mqtt_client.publish(mqtt_topics['anomalies'], freq_mhz)
-                    mqtt_client.publish(mqtt_topics['modulation'],f"{modulation_type}")
                     mqtt_client.publish(mqtt_topics['signal_strength'], f"{signal_strength_db:.2f}")
                     mqtt_client.publish(mqtt_topics['coordinates'], f"Latitude: {receiver_lat}, Longitude: {receiver_lon}")
-                    print(f"Anomaly detected at {freq_mhz:.2f} MHz with {modulation_type} modulation, Signal Strength: {signal_strength_db:.2f} dB")
-                
-                current_freq += freq_step
+                    print(f"Monitoring {freq_mhz:.2f} MHz, Signal Strength: {signal_strength_db:.2f} dB")
 
-# MQTT setup function
-def setup_mqtt(mqtt_broker, mqtt_port):
-    client = mqtt.Client()
-    client.connect(mqtt_broker, mqtt_port, 60)
-    return client
+                current_freq += freq_step
 
 # Main execution
 if __name__ == "__main__":
@@ -118,8 +141,9 @@ if __name__ == "__main__":
         # Load the configuration
         ham_bands, freq_step, sample_rate, runs_per_freq, receiver_lat, receiver_lon, mqtt_broker, mqtt_port, mqtt_topics = read_config()
 
-        # Load the pre-trained anomaly detection model
-        anomaly_model = load_anomaly_model('anomaly_detection_model.pkl')
+        # Load the pre-trained RF fingerprinting and anomaly detection models
+        anomaly_model = load_anomaly_detection_model('anomaly_detection_model.pkl')
+        rf_model = load_rf_fingerprinting_model('rf_fingerprinting_model.pkl')
 
         # Instantiate RTL-SDR
         sdr = RtlSdr()
@@ -131,7 +155,7 @@ if __name__ == "__main__":
         mqtt_client.loop_start()
 
         # Monitor the ham bands for anomalies and report results to MQTT
-        monitor_spectrum(sdr, anomaly_model, mqtt_client, ham_bands, freq_step, sample_rate, runs_per_freq, mqtt_topics, receiver_lat, receiver_lon)
+        monitor_spectrum(sdr, rf_model, anomaly_model, mqtt_client, ham_bands, freq_step, sample_rate, runs_per_freq, mqtt_topics, receiver_lat, receiver_lon)
 
     except KeyboardInterrupt:
         print("Monitoring stopped by user.")
