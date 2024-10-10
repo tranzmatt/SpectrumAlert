@@ -6,7 +6,7 @@ from rtlsdr import RtlSdr
 import paho.mqtt.client as mqtt
 
 # Function to read and parse the config file
-def read_config(config_file='config.ini'):
+def read_config(config_file='Trainer/config.ini'):
     config = configparser.ConfigParser()
     config.read(config_file)
 
