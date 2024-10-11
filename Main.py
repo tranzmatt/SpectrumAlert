@@ -22,7 +22,8 @@ def main():
         choice = input("Enter your choice (1-4): ")
 
         if choice == "1":
-            os.system("python3 DataGathering.py")
+            duration = input("Enter the duration for data gathering (in minutes): ")
+            os.system(f"python3 DataGathering.py {duration}")
         elif choice == "2":
             os.system("python3 ModelTrainer.py")
         elif choice == "3":

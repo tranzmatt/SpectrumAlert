@@ -74,52 +74,45 @@ def extract_features(iq_data):
         spectral_entropy, papr, band_energy_ratio
     ]
 
-# Function to gather IQ data and extract features
-def gather_iq_data_continuous(sdr, ham_bands, freq_step, runs_per_freq, filename):
-    header_written = False  # To ensure we write the CSV header only once
+
+# Function to gather IQ data with a time limit
+def gather_iq_data_continuous(sdr, ham_bands, freq_step, runs_per_freq, filename, duration_minutes):
+    header_written = False
     start_time = time.time()
+    duration_seconds = duration_minutes * 60  # Convert minutes to seconds
+    collected_features = []
 
     # Initialize IsolationForest for anomaly detection
     anomaly_detector = IsolationForest(contamination=0.05, random_state=42)
-    collected_features = []
 
-    while True:  # Infinite loop to gather data continuously
+    while time.time() - start_time < duration_seconds:  # Run for the specified duration
         for band_start, band_end in ham_bands:
             current_freq = band_start
             while current_freq <= band_end:
                 run_features = []
                 for _ in range(runs_per_freq):
                     sdr.center_freq = current_freq
-                    sdr.gain = adjust_gain(sdr)  # Adjust gain dynamically based on signal strength
-                    iq_samples = sdr.read_samples(256 * 1024)  # Increase the number of samples for better accuracy
+                    sdr.gain = adjust_gain(sdr)
+                    iq_samples = sdr.read_samples(256 * 1024)
                     features = extract_features(iq_samples)
                     run_features.append(features)
 
-                # Average over multiple runs
                 avg_features = np.mean(run_features, axis=0)
                 data = [current_freq] + avg_features.tolist()
                 collected_features.append(avg_features)
 
                 print(f"Collected data at {current_freq / 1e6:.2f} MHz")
 
-                # Detect anomalies if enough data has been collected
                 if len(collected_features) > 50:
                     anomaly_detector.fit(collected_features)
                     is_anomaly = anomaly_detector.predict([avg_features])[0] == -1
                     if is_anomaly:
-                        print(f"Anomaly detected at {current_freq / 1e6:.2f} MHz with features: {avg_features}")
+                        print(f"Anomaly detected at {current_freq / 1e6:.2f} MHz")
 
-                # Save the collected data to CSV
                 save_data_to_csv(data, filename, header_written)
-                header_written = True  # Header has been written after the first save
+                header_written = True
 
-                # Move to the next frequency step
                 current_freq += freq_step
-
-        # Reset timer to save every 60 seconds
-        current_time = time.time()
-        if current_time - start_time > 60:
-            start_time = current_time  # Reset timer
 
 # Function to dynamically adjust the SDR gain based on signal strength
 def adjust_gain(sdr):
@@ -151,26 +144,28 @@ def save_data_to_csv(data, filename, header_written):
     
     print(f"Data saved to {filename}")
 
-# Main execution
+## Main execution
 if __name__ == "__main__":
-    sdr = None  # Initialize sdr to None
+    sdr = None
     try:
-        # Read the configuration file
-        ham_bands, freq_step, sample_rate, runs_per_freq = read_config()
+        # Check if duration was passed as argument
+        if len(sys.argv) > 1:
+            duration = float(sys.argv[1])  # Get the duration from the command-line argument
+        else:
+            raise ValueError("No duration specified. Please provide the duration in minutes as an argument.")
 
-        # Instantiate RTL-SDR
+        ham_bands, freq_step, sample_rate, runs_per_freq = read_config()
         sdr = RtlSdr()
         sdr.sample_rate = sample_rate
 
-        # Start continuous IQ data collection
-        print("Starting continuous IQ data collection...")
-        gather_iq_data_continuous(sdr, ham_bands, freq_step, runs_per_freq, 'collected_iq_data.csv')
+        print(f"Starting IQ data collection for {duration} minutes...")
+        gather_iq_data_continuous(sdr, ham_bands, freq_step, runs_per_freq, 'collected_iq_data.csv', duration)
 
     except KeyboardInterrupt:
         print("Data collection interrupted by user.")
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
-        if sdr is not None:  # Only close SDR if it was successfully initialized
+        if sdr is not None:
             sdr.close()
             print("Closed SDR device.")
