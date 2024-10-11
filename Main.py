@@ -23,11 +23,11 @@ def main():
 
         if choice == "1":
             duration = input("Enter the duration for data gathering (in minutes): ")
-            os.system(f"python3 DataGathering.py {duration}")
+            os.system(f"python3 Trainer/DataGathering.py {duration}")
         elif choice == "2":
-            os.system("python3 ModelTrainer.py")
+            os.system("python3 Trainer/ModelTrainer.py")
         elif choice == "3":
-            os.system("python3 Monitor.py")
+            os.system("python3 Trainer/Monitor.py")
         elif choice == "4":
             print("Exiting... Goodbye!")
             break
@@ -36,3 +36,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+1

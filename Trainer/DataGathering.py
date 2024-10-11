@@ -5,6 +5,7 @@ import os
 import csv
 import time
 from sklearn.ensemble import IsolationForest
+import sys
 
 # Function to read and parse the config file
 def read_config(config_file='Trainer/config.ini'):
