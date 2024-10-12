@@ -60,8 +60,7 @@ def load_rf_fingerprinting_model(model_file='rf_fingerprinting_model.pkl'):
         print("No pre-trained RF fingerprinting model found. A new model will be created.")
     return model
 
-# Function to extract features from IQ data
-def extract_features(iq_data):
+def extract_features(iq_data, target_num_features=None):
     I = np.real(iq_data)
     Q = np.imag(iq_data)
     amplitude = np.sqrt(I**2 + Q**2)
@@ -84,10 +83,21 @@ def extract_features(iq_data):
     # Cyclostationary features (simplified)
     cyclo_autocorr = np.abs(np.correlate(amplitude, amplitude, mode='full')[len(amplitude)//2:]).mean()
 
-    return [
+    features = [
         mean_amplitude, std_amplitude, mean_fft_magnitude, std_fft_magnitude,
         skew_amplitude, kurt_amplitude, skew_phase, kurt_phase, cyclo_autocorr
     ]
+
+    # If target_num_features is provided, adjust the features list accordingly
+    if target_num_features is not None:
+        if len(features) < target_num_features:
+            # Pad with zeros if fewer features than expected
+            features += [0] * (target_num_features - len(features))
+        elif len(features) > target_num_features:
+            # Trim features if there are more than expected
+            features = features[:target_num_features]
+
+    return features
 
 # Function to calculate signal strength (placeholder)
 def calculate_signal_strength(iq_data):
@@ -101,10 +111,16 @@ def setup_mqtt(broker, port):
     client.connect(broker, port, 60)
     return client
 
-# Function to monitor the ham bands and publish anomalies to MQTT
 def monitor_spectrum(sdr, model, anomaly_model, mqtt_client, ham_bands, freq_step, sample_rate, runs_per_freq, mqtt_topics, receiver_lat, receiver_lon):
     known_features = []
     similarity_threshold = 0.3  # Threshold to consider a device as similar
+
+    # Get the number of features the anomaly_model expects
+    try:
+        expected_num_features = anomaly_model.estimators_[0].n_features_in_
+    except AttributeError:
+        # If the model is not yet fitted, you can set a default number or handle it as needed
+        expected_num_features = 9  # Default to the current number of features if unknown
 
     while True:
         for band_start, band_end in ham_bands:
@@ -113,7 +129,7 @@ def monitor_spectrum(sdr, model, anomaly_model, mqtt_client, ham_bands, freq_ste
                 for _ in range(runs_per_freq):
                     sdr.center_freq = current_freq
                     iq_samples = sdr.read_samples(128 * 1024)
-                    features = extract_features(iq_samples)
+                    features = extract_features(iq_samples, target_num_features=expected_num_features)
                     signal_strength_db = calculate_signal_strength(iq_samples)
 
                     # Detect anomalies

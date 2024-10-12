@@ -1,9 +1,10 @@
 import json
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier, IsolationForest
-from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score , StratifiedKFold
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.cluster import DBSCAN
+from collections import Counter
 import joblib
 import os
 import csv
@@ -22,7 +23,7 @@ def load_data_from_csv(filename):
 
     return np.array(features)
 
-# Function to train an RF fingerprinting model and anomaly detection model
+
 def train_rf_fingerprinting_model(features):
     # Splitting data into training and testing sets
     if len(features) < 2:
@@ -31,21 +32,33 @@ def train_rf_fingerprinting_model(features):
 
     X_train, X_test = train_test_split(features, test_size=0.2, random_state=42)
 
+    # Dynamically generate labels (simulate multiple devices)
+    labels = [f"Device_{i % 10}" for i in range(len(X_train))]
+
+    # Count samples per class
+    class_counts = Counter(labels)
+    min_samples_per_class = min(class_counts.values())
+
+    # Determine maximum number of splits for cross-validation
+    max_cv_splits = min(5, min_samples_per_class)  # Ensure cv doesn't exceed the smallest class size
+
+    print(f"Using {max_cv_splits}-fold cross-validation (based on smallest class size).")
+
     # Initializing the RandomForestClassifier model
     model = RandomForestClassifier(random_state=42)
 
-    # Setting up hyperparameter tuning with GridSearchCV
+    # Setting up hyperparameter tuning with GridSearchCV and StratifiedKFold
     param_grid = {
         'n_estimators': [50, 100, 150],
         'max_depth': [None, 10, 20, 30],
         'min_samples_split': [2, 5, 10],
         'min_samples_leaf': [1, 2, 4]
     }
-    grid_search = GridSearchCV(estimator=model, param_grid=param_grid, cv=5, n_jobs=-1, verbose=2)
+    skf = StratifiedKFold(n_splits=max_cv_splits)
+    grid_search = GridSearchCV(estimator=model, param_grid=param_grid, cv=skf, n_jobs=-1, verbose=2)
 
     # Train the model on the training data
     print("Training the RF fingerprinting model with hyperparameter tuning...")
-    labels = [f"Device_{i % 10}" for i in range(len(X_train))]  # Use generated labels to simulate multiple devices
     grid_search.fit(X_train, labels)
 
     # Best model from grid search
@@ -61,7 +74,7 @@ def train_rf_fingerprinting_model(features):
 
     # Cross-validation for more reliable performance evaluation
     cv_labels = [f"Device_{i % 10}" for i in range(len(features))]  # Consistent labels for cross-validation
-    cv_scores = cross_val_score(best_model, features, cv_labels, cv=5)
+    cv_scores = cross_val_score(best_model, features, cv_labels, cv=skf)
     print(f"Cross-validation scores: {cv_scores}")
     print(f"Mean cross-validation score: {np.mean(cv_scores) * 100:.2f}%")
 
@@ -72,7 +85,6 @@ def train_rf_fingerprinting_model(features):
     print("Anomaly detection model trained successfully.")
 
     return best_model, anomaly_detector
-
 # Function to save the trained models to files
 def save_model_to_file(model, filename='rf_fingerprinting_model.pkl'):
     joblib.dump(model, filename)
