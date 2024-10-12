@@ -5,6 +5,8 @@ import os
 import csv
 import time
 from sklearn.ensemble import IsolationForest
+from sklearn.decomposition import PCA
+from concurrent.futures import ThreadPoolExecutor
 import sys
 
 # Function to read and parse the config file
@@ -16,11 +18,9 @@ def read_config(config_file='Trainer/config.ini'):
     
     config.read(config_file)
 
-    # Check if 'HAM_BANDS' section exists in config
     if 'HAM_BANDS' not in config:
         raise ValueError("'HAM_BANDS' section missing in the config file.")
 
-    # Parse HAM bands
     ham_bands_str = config['HAM_BANDS'].get('bands', None)
     if ham_bands_str is None:
         raise ValueError("Missing 'bands' entry in 'HAM_BANDS' section.")
@@ -33,21 +33,19 @@ def read_config(config_file='Trainer/config.ini'):
         except ValueError:
             raise ValueError(f"Invalid frequency range format: {band}. Expected 'start-end'.")
 
-    # Parse general settings
     freq_step = float(config['GENERAL'].get('freq_step', 500e3))
     sample_rate = float(config['GENERAL'].get('sample_rate', 2.048e6))
     runs_per_freq = int(config['GENERAL'].get('runs_per_freq', 5))
 
     return ham_bands, freq_step, sample_rate, runs_per_freq
 
-# Function to extract enhanced features from IQ data for RF fingerprinting
+# Function to extract enhanced features from IQ data
 def extract_features(iq_data):
     I = np.real(iq_data)
     Q = np.imag(iq_data)
     amplitude = np.sqrt(I**2 + Q**2)
     phase = np.unwrap(np.angle(iq_data))
 
-    # Basic features
     fft_values = np.fft.fft(iq_data)
     fft_magnitude = np.abs(fft_values)
     mean_amplitude = np.mean(amplitude)
@@ -55,16 +53,12 @@ def extract_features(iq_data):
     mean_fft_magnitude = np.mean(fft_magnitude)
     std_fft_magnitude = np.std(fft_magnitude)
 
-    # Higher-order statistics for RF fingerprinting
     skew_amplitude = np.mean((amplitude - mean_amplitude) ** 3) / (std_amplitude ** 3)
     kurt_amplitude = np.mean((amplitude - mean_amplitude) ** 4) / (std_amplitude ** 4)
     skew_phase = np.mean((phase - np.mean(phase)) ** 3) / (np.std(phase) ** 3)
     kurt_phase = np.mean((phase - np.mean(phase)) ** 4) / (np.std(phase) ** 4)
 
-    # Cyclostationary features (simplified)
     cyclo_autocorr = np.abs(np.correlate(amplitude, amplitude, mode='full')[len(amplitude)//2:]).mean()
-
-    # Additional features for enrichment
     spectral_entropy = -np.sum((fft_magnitude / np.sum(fft_magnitude)) * np.log2(fft_magnitude / np.sum(fft_magnitude) + 1e-12))
     papr = np.max(amplitude) ** 2 / np.mean(amplitude ** 2)
     band_energy_ratio = np.sum(fft_magnitude[:len(fft_magnitude)//2]) / np.sum(fft_magnitude)
@@ -75,66 +69,12 @@ def extract_features(iq_data):
         spectral_entropy, papr, band_energy_ratio
     ]
 
-
-# Function to gather IQ data with a time limit
-def gather_iq_data_continuous(sdr, ham_bands, freq_step, runs_per_freq, filename, duration_minutes):
-    header_written = False
-    start_time = time.time()
-    duration_seconds = duration_minutes * 60  # Convert minutes to seconds
-    collected_features = []
-
-    # Initialize IsolationForest for anomaly detection
-    anomaly_detector = IsolationForest(contamination=0.05, random_state=42)
-
-    while time.time() - start_time < duration_seconds:  # Run for the specified duration
-        for band_start, band_end in ham_bands:
-            current_freq = band_start
-            while current_freq <= band_end:
-                run_features = []
-                for _ in range(runs_per_freq):
-                    sdr.center_freq = current_freq
-                    sdr.gain = adjust_gain(sdr)
-                    iq_samples = sdr.read_samples(256 * 1024)
-                    features = extract_features(iq_samples)
-                    run_features.append(features)
-
-                avg_features = np.mean(run_features, axis=0)
-                data = [current_freq] + avg_features.tolist()
-                collected_features.append(avg_features)
-
-                print(f"Collected data at {current_freq / 1e6:.2f} MHz")
-
-                if len(collected_features) > 50:
-                    anomaly_detector.fit(collected_features)
-                    is_anomaly = anomaly_detector.predict([avg_features])[0] == -1
-                    if is_anomaly:
-                        print(f"Anomaly detected at {current_freq / 1e6:.2f} MHz")
-
-                save_data_to_csv(data, filename, header_written)
-                header_written = True
-
-                current_freq += freq_step
-
-# Function to dynamically adjust the SDR gain based on signal strength
-def adjust_gain(sdr):
-    # Adjust gain dynamically by evaluating signal power and choosing an optimal gain value
-    power = np.mean(np.abs(sdr.read_samples(1024)) ** 2)
-    if power < -40:
-        return 40  # Set to high gain if the signal is weak
-    elif power < -20:
-        return 20  # Set to moderate gain for medium strength signals
-    else:
-        return 10  # Set to low gain for strong signals
-
 # Function to save the collected data as a CSV
 def save_data_to_csv(data, filename, header_written):
     directory = os.path.dirname(filename)
-
-    # Create directory if it doesn't exist and if a directory path is provided
     if directory:
         os.makedirs(directory, exist_ok=True)
     
-    # Save data to CSV file
     with open(filename, 'a', newline='') as f:
         writer = csv.writer(f)
         if not header_written:
@@ -145,13 +85,89 @@ def save_data_to_csv(data, filename, header_written):
     
     print(f"Data saved to {filename}")
 
-## Main execution
+# Function to dynamically adjust the SDR gain based on signal strength
+def adjust_gain(sdr):
+    power = np.mean(np.abs(sdr.read_samples(1024)) ** 2)
+    if power < -40:
+        return 40
+    elif power < -20:
+        return 20
+    else:
+        return 10
+
+# Function to scan a single band
+def scan_band(sdr, band_start, band_end, freq_step, runs_per_freq, filename, anomaly_detector, pca, header_written):
+    current_freq = band_start
+    collected_features = []
+    while current_freq <= band_end:
+        run_features = []
+        for _ in range(runs_per_freq):
+            sdr.center_freq = current_freq
+            sdr.gain = adjust_gain(sdr)
+            iq_samples = sdr.read_samples(256 * 1024)
+            features = extract_features(iq_samples)
+            run_features.append(features)
+
+        avg_features = np.mean(run_features, axis=0)
+        
+        # Apply PCA for dimensionality reduction
+        reduced_features = pca.transform([avg_features])
+        data = [current_freq] + reduced_features[0].tolist()
+        
+        collected_features.append(avg_features)
+        save_data_to_csv(data, filename, header_written)
+        
+        # Anomaly detection
+        if len(collected_features) > 50:
+            anomaly_detector.fit(collected_features)
+            is_anomaly = anomaly_detector.predict([avg_features])[0] == -1
+            if is_anomaly:
+                print(f"Anomaly detected at {current_freq / 1e6:.2f} MHz")
+        
+        current_freq += freq_step
+
+# Main function for parallel processing of bands
+def gather_iq_data_parallel(sdr, ham_bands, freq_step, runs_per_freq, filename, duration_minutes):
+    header_written = False
+    start_time = time.time()
+    duration_seconds = duration_minutes * 60
+    
+    # Initialize IsolationForest
+    anomaly_detector = IsolationForest(contamination=0.05, random_state=42)
+    
+    # Collect initial data to fit PCA
+    pca_training_data = []
+    for band_start, band_end in ham_bands:
+        sdr.center_freq = band_start
+        sdr.gain = adjust_gain(sdr)
+        iq_samples = sdr.read_samples(256 * 1024)
+        features = extract_features(iq_samples)
+        pca_training_data.append(features)
+
+    # Determine dynamic number of components for PCA
+    num_features = len(pca_training_data[0])
+    num_samples = len(pca_training_data)
+    n_components = min(8, num_samples, num_features)
+
+    # Fit PCA on the collected data
+    pca = PCA(n_components=n_components)
+    pca.fit(pca_training_data)
+
+    # Parallel scanning of bands
+    with ThreadPoolExecutor() as executor:
+        futures = []
+        for band_start, band_end in ham_bands:
+            futures.append(executor.submit(scan_band, sdr, band_start, band_end, freq_step, runs_per_freq, filename, anomaly_detector, pca, header_written))
+
+        for future in futures:
+            future.result()
+
+# Main execution
 if __name__ == "__main__":
     sdr = None
     try:
-        # Check if duration was passed as argument
         if len(sys.argv) > 1:
-            duration = float(sys.argv[1])  # Get the duration from the command-line argument
+            duration = float(sys.argv[1])
         else:
             raise ValueError("No duration specified. Please provide the duration in minutes as an argument.")
 
@@ -160,7 +176,7 @@ if __name__ == "__main__":
         sdr.sample_rate = sample_rate
 
         print(f"Starting IQ data collection for {duration} minutes...")
-        gather_iq_data_continuous(sdr, ham_bands, freq_step, runs_per_freq, 'collected_iq_data.csv', duration)
+        gather_iq_data_parallel(sdr, ham_bands, freq_step, runs_per_freq, 'collected_iq_data.csv', duration)
 
     except KeyboardInterrupt:
         print("Data collection interrupted by user.")
