@@ -1,9 +1,3 @@
-Here’s a **README.md** file for your software that includes installation instructions, use cases, example scenarios, and explanations of the software’s capabilities, including its ability to detect anomalies and track suspected devices for direction finding.
-
-### README.md
-
----
-
 # Spectrum Alert
 
 **Spectrum Alert** is a software suite designed to monitor ham radio frequencies for anomalies, perform radio frequency (RF) fingerprinting, and provide real-time insights into radio spectrum usage. This tool can be deployed on multiple devices to perform direction finding and detect illegal or unauthorized transmissions.
