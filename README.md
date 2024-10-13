@@ -40,8 +40,8 @@
 ### Installation Steps:
 1. Clone the repository:
    ```bash
-   git clone https://github.com/slayingripper/spectrum-alert.git
-   cd spectrum-alert
+   git clone https://github.com/Slayingripper/SpectrumAlert.git
+   cd SpectrumAlert
    ```
 
 2. Install required Python packages:
