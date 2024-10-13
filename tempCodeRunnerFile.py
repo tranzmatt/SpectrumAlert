@@ -1,3 +1,0 @@
-
-
-        elif choice == "6":
