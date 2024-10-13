@@ -46,7 +46,7 @@
 
 2. Install required Python packages:
    ```bash
-   pip install numpy scikit-learn rtlsdr configparser paho-mqtt joblib
+   pip install numpy scikit-learn pyrtlsdr configparser paho-mqtt joblib
    ```
 
 3. Connect your RTL-SDR device to your system.
