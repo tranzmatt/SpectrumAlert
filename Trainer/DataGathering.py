@@ -4,7 +4,6 @@ from rtlsdr import RtlSdr
 import os
 import csv
 import time
-from sklearn.ensemble import IsolationForest
 from sklearn.decomposition import PCA
 from concurrent.futures import ThreadPoolExecutor
 import sys
@@ -47,25 +46,65 @@ def read_config(config_file='Trainer/config.ini'):
 def extract_features(iq_data):
     I = np.real(iq_data)
     Q = np.imag(iq_data)
-    amplitude = np.sqrt(I**2 + Q**2)
-    phase = np.unwrap(np.angle(iq_data))
+    amplitude = np.sqrt(I**2 + Q**2)  # Magnitude of the complex signal
+    phase = np.unwrap(np.angle(iq_data))  # Unwrap the phase
 
+    # FFT of the signal
     fft_values = np.fft.fft(iq_data)
     fft_magnitude = np.abs(fft_values)
+
+    # Mean and standard deviation of the amplitude
     mean_amplitude = np.mean(amplitude)
     std_amplitude = np.std(amplitude)
+
+    # Mean and standard deviation of the FFT magnitude
     mean_fft_magnitude = np.mean(fft_magnitude)
     std_fft_magnitude = np.std(fft_magnitude)
 
-    skew_amplitude = np.mean((amplitude - mean_amplitude) ** 3) / (std_amplitude ** 3)
-    kurt_amplitude = np.mean((amplitude - mean_amplitude) ** 4) / (std_amplitude ** 4)
-    skew_phase = np.mean((phase - np.mean(phase)) ** 3) / (np.std(phase) ** 3)
-    kurt_phase = np.mean((phase - np.mean(phase)) ** 4) / (np.std(phase) ** 4)
+    # Skewness and kurtosis of amplitude
+    if std_amplitude != 0:
+        skew_amplitude = np.mean((amplitude - mean_amplitude) ** 3) / (std_amplitude ** 3)
+        kurt_amplitude = np.mean((amplitude - mean_amplitude) ** 4) / (std_amplitude ** 4)
+    else:
+        skew_amplitude = 0
+        kurt_amplitude = 0
 
-    cyclo_autocorr = np.abs(np.correlate(amplitude, amplitude, mode='full')[len(amplitude)//2:]).mean()
-    spectral_entropy = -np.sum((fft_magnitude / np.sum(fft_magnitude)) * np.log2(fft_magnitude / np.sum(fft_magnitude) + 1e-12))
-    papr = np.max(amplitude) ** 2 / np.mean(amplitude ** 2)
-    band_energy_ratio = np.sum(fft_magnitude[:len(fft_magnitude)//2]) / np.sum(fft_magnitude)
+    # Skewness and kurtosis of phase
+    std_phase = np.std(phase)
+    mean_phase = np.mean(phase)
+    if std_phase != 0:
+        skew_phase = np.mean((phase - mean_phase) ** 3) / (std_phase ** 3)
+        kurt_phase = np.mean((phase - mean_phase) ** 4) / (std_phase ** 4)
+    else:
+        skew_phase = 0
+        kurt_phase = 0
+
+    # Cyclostationary autocorrelation (average of autocorrelation)
+    if len(amplitude) > 1:
+        cyclo_autocorr = np.abs(np.correlate(amplitude, amplitude, mode='full')[len(amplitude) // 2:]).mean()
+    else:
+        cyclo_autocorr = 0
+
+    # Spectral entropy (FFT magnitude normalized)
+    fft_magnitude_sum = np.sum(fft_magnitude)
+    if fft_magnitude_sum > 0:
+        normalized_fft = fft_magnitude / fft_magnitude_sum
+        spectral_entropy = -np.sum(normalized_fft * np.log2(normalized_fft + 1e-12))  # Add small value to avoid log(0)
+    else:
+        spectral_entropy = 0
+
+    # Peak-to-Average Power Ratio (PAPR)
+    if mean_amplitude > 0:
+        papr = np.max(amplitude) ** 2 / np.mean(amplitude ** 2)
+    else:
+        papr = 0
+
+    # Band Energy Ratio (lower half of FFT vs total)
+    fft_magnitude_half = fft_magnitude[:len(fft_magnitude) // 2]
+    if fft_magnitude_sum > 0:
+        band_energy_ratio = np.sum(fft_magnitude_half) / fft_magnitude_sum
+    else:
+        band_energy_ratio = 0
 
     return [
         mean_amplitude, std_amplitude, mean_fft_magnitude, std_fft_magnitude,
@@ -87,14 +126,20 @@ def save_data_to_csv(data, filename, header_written):
                                  'Skew_Amplitude', 'Kurt_Amplitude', 'Skew_Phase', 'Kurt_Phase', 'Cyclo_Autocorr',
                                  'Spectral_Entropy', 'PAPR', 'Band_Energy_Ratio'])
                 header_written = True  # Update the flag after writing the header
+            
+            # Debug: Print the data being written to the CSV
+            print(f"Writing to CSV: {data}")
+            
             writer.writerow(data)
 
     print(f"Data saved to {filename}")
     return header_written  # Return the updated flag
 
-def scan_band(sdr, band_start, band_end, freq_step, runs_per_freq, filename, anomaly_detector, pca, header_written):
+# Function to scan a single band
+def scan_band(sdr, band_start, band_end, freq_step, runs_per_freq, filename, pca, header_written):
     current_freq = band_start
     collected_features = []
+    
     while current_freq <= band_end:
         run_features = []
         for _ in range(runs_per_freq):
@@ -104,34 +149,24 @@ def scan_band(sdr, band_start, band_end, freq_step, runs_per_freq, filename, ano
             run_features.append(features)
 
         avg_features = np.mean(run_features, axis=0)
+        reduced_features = pca.transform([avg_features])  # Use avg_features directly for the complete feature list
         
-        # Apply PCA for dimensionality reduction
-        reduced_features = pca.transform([avg_features])
-        data = [current_freq] + reduced_features[0].tolist()
+        data = [current_freq] + avg_features.tolist()  # Add the frequency and all features to the data
         
-        collected_features.append(avg_features)
-        header_written = save_data_to_csv(data, filename, header_written)  # Update header_written after first save
+        # Save to CSV and update the header_written flag
+        header_written = save_data_to_csv(data, filename, header_written)
         
-        # Anomaly detection
-        if len(collected_features) > 50:
-            anomaly_detector.fit(collected_features)
-            is_anomaly = anomaly_detector.predict([avg_features])[0] == -1
-            if is_anomaly:
-                print(f"Anomaly detected at {current_freq / 1e6:.2f} MHz")
-        
+        # Move to the next frequency
         current_freq += freq_step
 
     return header_written  # Return updated flag
 
 # Main function for parallel processing of bands
 def gather_iq_data_parallel(sdr, ham_bands, freq_step, runs_per_freq, filename, duration_minutes):
-    header_written = False  # Initial flag value
+    header_written = False  # Ensure this flag is shared across all threads
     start_time = time.time()
     duration_seconds = duration_minutes * 60
-    
-    # Initialize IsolationForest
-    anomaly_detector = IsolationForest(contamination=0.05, random_state=42)
-    
+
     # Collect initial data to fit PCA
     pca_training_data = []
     for band_start, band_end in ham_bands:
@@ -140,12 +175,9 @@ def gather_iq_data_parallel(sdr, ham_bands, freq_step, runs_per_freq, filename, 
         features = extract_features(iq_samples)
         pca_training_data.append(features)
 
-    # Determine dynamic number of components for PCA
     num_features = len(pca_training_data[0])
-    num_samples = len(pca_training_data)
-    n_components = min(8, num_samples, num_features)
+    n_components = min(8, len(pca_training_data), num_features)
 
-    # Fit PCA on the collected data
     pca = PCA(n_components=n_components)
     pca.fit(pca_training_data)
 
@@ -153,11 +185,11 @@ def gather_iq_data_parallel(sdr, ham_bands, freq_step, runs_per_freq, filename, 
     with ThreadPoolExecutor() as executor:
         futures = []
         for band_start, band_end in ham_bands:
-            futures.append(executor.submit(scan_band, sdr, band_start, band_end, freq_step, runs_per_freq, filename, anomaly_detector, pca, header_written))
+            futures.append(executor.submit(scan_band, sdr, band_start, band_end, freq_step, runs_per_freq, filename, pca, header_written))
 
-        # Retrieve results and update header_written
+        # After each thread finishes, update the header_written flag
         for future in futures:
-            header_written = future.result()  # Update header_written after each band scan
+            header_written = future.result()  # Update the header_written flag after each band scan
 
 # Main execution
 if __name__ == "__main__":
