@@ -8,6 +8,10 @@ from sklearn.ensemble import IsolationForest
 from sklearn.decomposition import PCA
 from concurrent.futures import ThreadPoolExecutor
 import sys
+import threading
+
+# Thread lock for safe file access
+file_lock = threading.Lock()
 
 # Function to read and parse the config file
 def read_config(config_file='Trainer/config.ini'):
@@ -74,28 +78,20 @@ def save_data_to_csv(data, filename, header_written):
     directory = os.path.dirname(filename)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    
-    with open(filename, 'a', newline='') as f:
-        writer = csv.writer(f)
-        if not header_written:
-            writer.writerow(['Frequency', 'Mean_Amplitude', 'Std_Amplitude', 'Mean_FFT_Magnitude', 'Std_FFT_Magnitude',
-                             'Skew_Amplitude', 'Kurt_Amplitude', 'Skew_Phase', 'Kurt_Phase', 'Cyclo_Autocorr',
-                             'Spectral_Entropy', 'PAPR', 'Band_Energy_Ratio'])
-        writer.writerow(data)
-    
+
+    with file_lock:  # Ensure thread-safe file writing
+        with open(filename, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if not header_written:
+                writer.writerow(['Frequency', 'Mean_Amplitude', 'Std_Amplitude', 'Mean_FFT_Magnitude', 'Std_FFT_Magnitude',
+                                 'Skew_Amplitude', 'Kurt_Amplitude', 'Skew_Phase', 'Kurt_Phase', 'Cyclo_Autocorr',
+                                 'Spectral_Entropy', 'PAPR', 'Band_Energy_Ratio'])
+                header_written = True  # Update the flag after writing the header
+            writer.writerow(data)
+
     print(f"Data saved to {filename}")
+    return header_written  # Return the updated flag
 
-# Function to dynamically adjust the SDR gain based on signal strength
-def adjust_gain(sdr):
-    power = np.mean(np.abs(sdr.read_samples(1024)) ** 2)
-    if power < -40:
-        return 40
-    elif power < -20:
-        return 20
-    else:
-        return 10
-
-# Function to scan a single band
 def scan_band(sdr, band_start, band_end, freq_step, runs_per_freq, filename, anomaly_detector, pca, header_written):
     current_freq = band_start
     collected_features = []
@@ -103,7 +99,6 @@ def scan_band(sdr, band_start, band_end, freq_step, runs_per_freq, filename, ano
         run_features = []
         for _ in range(runs_per_freq):
             sdr.center_freq = current_freq
-            sdr.gain = adjust_gain(sdr)
             iq_samples = sdr.read_samples(256 * 1024)
             features = extract_features(iq_samples)
             run_features.append(features)
@@ -115,7 +110,7 @@ def scan_band(sdr, band_start, band_end, freq_step, runs_per_freq, filename, ano
         data = [current_freq] + reduced_features[0].tolist()
         
         collected_features.append(avg_features)
-        save_data_to_csv(data, filename, header_written)
+        header_written = save_data_to_csv(data, filename, header_written)  # Update header_written after first save
         
         # Anomaly detection
         if len(collected_features) > 50:
@@ -126,9 +121,11 @@ def scan_band(sdr, band_start, band_end, freq_step, runs_per_freq, filename, ano
         
         current_freq += freq_step
 
+    return header_written  # Return updated flag
+
 # Main function for parallel processing of bands
 def gather_iq_data_parallel(sdr, ham_bands, freq_step, runs_per_freq, filename, duration_minutes):
-    header_written = False
+    header_written = False  # Initial flag value
     start_time = time.time()
     duration_seconds = duration_minutes * 60
     
@@ -139,7 +136,6 @@ def gather_iq_data_parallel(sdr, ham_bands, freq_step, runs_per_freq, filename, 
     pca_training_data = []
     for band_start, band_end in ham_bands:
         sdr.center_freq = band_start
-        sdr.gain = adjust_gain(sdr)
         iq_samples = sdr.read_samples(256 * 1024)
         features = extract_features(iq_samples)
         pca_training_data.append(features)
@@ -159,8 +155,9 @@ def gather_iq_data_parallel(sdr, ham_bands, freq_step, runs_per_freq, filename, 
         for band_start, band_end in ham_bands:
             futures.append(executor.submit(scan_band, sdr, band_start, band_end, freq_step, runs_per_freq, filename, anomaly_detector, pca, header_written))
 
+        # Retrieve results and update header_written
         for future in futures:
-            future.result()
+            header_written = future.result()  # Update header_written after each band scan
 
 # Main execution
 if __name__ == "__main__":

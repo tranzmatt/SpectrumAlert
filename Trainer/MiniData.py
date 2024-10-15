@@ -11,7 +11,7 @@ from sklearn.decomposition import PCA
 LITE_SAMPLE_SIZE = 128 * 1024  # Reduced sample size for Raspberry Pi
 LITE_SAMPLE_RATE = 1.024e6     # Reduced sample rate for efficiency
 LITE_RUNS_PER_FREQ = 3         # Fewer runs per frequency to save resources
-LITE_GAIN = 20                 # Simplified fixed gain for the lite version
+#LITE_GAIN = 20                 # Simplified fixed gain for the lite version
 
 # Function to read configuration file
 def read_config(config_file='config.ini'):
@@ -102,7 +102,7 @@ def gather_data_lite(sdr, ham_bands, freq_step, runs_per_freq, filename, duratio
                 run_features = []
                 for _ in range(runs_per_freq):
                     sdr.center_freq = current_freq
-                    sdr.gain = LITE_GAIN  # Use a simplified fixed gain for the lite version
+                   # sdr.gain = LITE_GAIN  # Use a simplified fixed gain for the lite version
                     iq_samples = sdr.read_samples(LITE_SAMPLE_SIZE)  # Reduced sample size for efficiency
                     features = extract_features(iq_samples)
                     run_features.append(features)
@@ -128,7 +128,7 @@ if __name__ == "__main__":
     # Initialize the SDR device
     sdr = RtlSdr()
     sdr.sample_rate = sample_rate  # Set sample rate from config file
-    sdr.gain = LITE_GAIN  # Set initial gain
+    #sdr.gain = LITE_GAIN  # Set initial gain
 
     # Get the duration for data gathering from user input
     duration = input("Enter the duration for data gathering (in minutes): ")
