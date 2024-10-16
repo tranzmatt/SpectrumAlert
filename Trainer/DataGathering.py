@@ -12,6 +12,10 @@ import threading
 # Thread lock for safe file access
 file_lock = threading.Lock()
 
+# Shared object for header written status
+header_lock = threading.Lock()
+header_written = False
+
 # Function to read and parse the config file
 def read_config(config_file='Trainer/config.ini'):
     config = configparser.ConfigParser()
@@ -113,7 +117,8 @@ def extract_features(iq_data):
     ]
 
 # Function to save the collected data as a CSV
-def save_data_to_csv(data, filename, header_written):
+def save_data_to_csv(data, filename):
+    global header_written
     directory = os.path.dirname(filename)
     if directory:
         os.makedirs(directory, exist_ok=True)
@@ -121,22 +126,22 @@ def save_data_to_csv(data, filename, header_written):
     with file_lock:  # Ensure thread-safe file writing
         with open(filename, 'a', newline='') as f:
             writer = csv.writer(f)
-            if not header_written:
-                writer.writerow(['Frequency', 'Mean_Amplitude', 'Std_Amplitude', 'Mean_FFT_Magnitude', 'Std_FFT_Magnitude',
-                                 'Skew_Amplitude', 'Kurt_Amplitude', 'Skew_Phase', 'Kurt_Phase', 'Cyclo_Autocorr',
-                                 'Spectral_Entropy', 'PAPR', 'Band_Energy_Ratio'])
-                header_written = True  # Update the flag after writing the header
+
+            with header_lock:
+                if not header_written:
+                    writer.writerow(['Frequency', 'Mean_Amplitude', 'Std_Amplitude', 'Mean_FFT_Magnitude', 'Std_FFT_Magnitude',
+                                     'Skew_Amplitude', 'Kurt_Amplitude', 'Skew_Phase', 'Kurt_Phase', 'Cyclo_Autocorr',
+                                     'Spectral_Entropy', 'PAPR', 'Band_Energy_Ratio'])
+                    header_written = True  # Update the flag after writing the header
             
             # Debug: Print the data being written to the CSV
             print(f"Writing to CSV: {data}")
-            
             writer.writerow(data)
 
     print(f"Data saved to {filename}")
-    return header_written  # Return the updated flag
 
 # Function to scan a single band
-def scan_band(sdr, band_start, band_end, freq_step, runs_per_freq, filename, pca, header_written):
+def scan_band(sdr, band_start, band_end, freq_step, runs_per_freq, filename, pca):
     current_freq = band_start
     collected_features = []
     
@@ -153,17 +158,14 @@ def scan_band(sdr, band_start, band_end, freq_step, runs_per_freq, filename, pca
         
         data = [current_freq] + avg_features.tolist()  # Add the frequency and all features to the data
         
-        # Save to CSV and update the header_written flag
-        header_written = save_data_to_csv(data, filename, header_written)
+        # Save to CSV
+        save_data_to_csv(data, filename)
         
         # Move to the next frequency
         current_freq += freq_step
 
-    return header_written  # Return updated flag
-
 # Main function for parallel processing of bands
 def gather_iq_data_parallel(sdr, ham_bands, freq_step, runs_per_freq, filename, duration_minutes):
-    header_written = False  # Ensure this flag is shared across all threads
     start_time = time.time()
     duration_seconds = duration_minutes * 60
 
@@ -185,11 +187,11 @@ def gather_iq_data_parallel(sdr, ham_bands, freq_step, runs_per_freq, filename, 
     with ThreadPoolExecutor() as executor:
         futures = []
         for band_start, band_end in ham_bands:
-            futures.append(executor.submit(scan_band, sdr, band_start, band_end, freq_step, runs_per_freq, filename, pca, header_written))
+            futures.append(executor.submit(scan_band, sdr, band_start, band_end, freq_step, runs_per_freq, filename, pca))
 
-        # After each thread finishes, update the header_written flag
+        # Wait for all threads to finish
         for future in futures:
-            header_written = future.result()  # Update the header_written flag after each band scan
+            future.result()
 
 # Main execution
 if __name__ == "__main__":
