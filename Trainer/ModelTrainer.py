@@ -40,7 +40,10 @@ def train_rf_fingerprinting_model(features):
     min_samples_per_class = min(class_counts.values())
 
     # Determine maximum number of splits for cross-validation
+        # Determine maximum number of splits for cross-validation
+    min_samples_per_class = min(class_counts.values())
     max_cv_splits = min(5, min_samples_per_class)  # Ensure cv doesn't exceed the smallest class size
+    max_cv_splits = max(2, max_cv_splits)  # Ensure at least 2 splits
 
     print(f"Using {max_cv_splits}-fold cross-validation (based on smallest class size).")
 

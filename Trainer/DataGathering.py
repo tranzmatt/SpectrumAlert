@@ -1,6 +1,5 @@
 import numpy as np
 import configparser
-from rtlsdr import RtlSdr
 import os
 import csv
 import time
@@ -8,7 +7,7 @@ from sklearn.decomposition import PCA
 from concurrent.futures import ThreadPoolExecutor
 import sys
 import threading
-
+from time import sleep
 # Thread lock for safe file access
 file_lock = threading.Lock()
 
@@ -43,8 +42,20 @@ def read_config(config_file='Trainer/config.ini'):
     freq_step = float(config['GENERAL'].get('freq_step', 500e3))
     sample_rate = float(config['GENERAL'].get('sample_rate', 2.048e6))
     runs_per_freq = int(config['GENERAL'].get('runs_per_freq', 5))
+    sdr_type = config['GENERAL'].get('sdr_type', 'rtlsdr')
 
-    return ham_bands, freq_step, sample_rate, runs_per_freq
+    return ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type
+
+# Function to import the necessary SDR library based on the SDR type
+def import_sdr_library(sdr_type):
+    if sdr_type == 'rtlsdr':
+        from rtlsdr import RtlSdr
+        return RtlSdr
+    elif sdr_type in ['limesdr', 'hackrf', 'rsp1a', 'usrp']:
+        from SoapySDR import Device as SoapyDevice
+        return SoapyDevice
+    else:
+        raise ValueError(f"Unsupported SDR type: {sdr_type}")
 
 # Function to extract enhanced features from IQ data
 def extract_features(iq_data):
@@ -139,10 +150,13 @@ def save_data_to_csv(data, filename):
             writer.writerow(data)
 
     print(f"Data saved to {filename}")
-
+    sleep(10)
 # Function to scan a single band
-def scan_band(sdr, band_start, band_end, freq_step, runs_per_freq, filename, pca):
+def scan_band(sdr_class, band_start, band_end, freq_step, runs_per_freq, filename, pca):
     current_freq = band_start
+    
+    sdr = sdr_class()  # Create separate SDR instance per thread
+    sdr.sample_rate = sample_rate  # Set the sample rate
     collected_features = []
     
     while current_freq <= band_end:
@@ -154,8 +168,10 @@ def scan_band(sdr, band_start, band_end, freq_step, runs_per_freq, filename, pca
             run_features.append(features)
 
         avg_features = np.mean(run_features, axis=0)
-        reduced_features = pca.transform([avg_features])  # Use avg_features directly for the complete feature list
+        with threading.Lock():
+            reduced_features = pca.transform([avg_features])  # Thread-safe PCA transformation
         
+        # Use all original features instead of PCA reduced features for saving
         data = [current_freq] + avg_features.tolist()  # Add the frequency and all features to the data
         
         # Save to CSV
@@ -163,19 +179,24 @@ def scan_band(sdr, band_start, band_end, freq_step, runs_per_freq, filename, pca
         
         # Move to the next frequency
         current_freq += freq_step
+    
+    sdr.close()  # Close the SDR instance after use
 
 # Main function for parallel processing of bands
-def gather_iq_data_parallel(sdr, ham_bands, freq_step, runs_per_freq, filename, duration_minutes):
+def gather_iq_data_parallel(sdr_class, ham_bands, freq_step, runs_per_freq, filename, duration_minutes):
     start_time = time.time()
     duration_seconds = duration_minutes * 60
 
     # Collect initial data to fit PCA
     pca_training_data = []
+    sdr = sdr_class()
+    sdr.sample_rate = sample_rate
     for band_start, band_end in ham_bands:
         sdr.center_freq = band_start
         iq_samples = sdr.read_samples(256 * 1024)
         features = extract_features(iq_samples)
         pca_training_data.append(features)
+    sdr.close()
 
     num_features = len(pca_training_data[0])
     n_components = min(8, len(pca_training_data), num_features)
@@ -187,7 +208,7 @@ def gather_iq_data_parallel(sdr, ham_bands, freq_step, runs_per_freq, filename, 
     with ThreadPoolExecutor() as executor:
         futures = []
         for band_start, band_end in ham_bands:
-            futures.append(executor.submit(scan_band, sdr, band_start, band_end, freq_step, runs_per_freq, filename, pca))
+            futures.append(executor.submit(scan_band, sdr_class, band_start, band_end, freq_step, runs_per_freq, filename, pca))
 
         # Wait for all threads to finish
         for future in futures:
@@ -195,25 +216,21 @@ def gather_iq_data_parallel(sdr, ham_bands, freq_step, runs_per_freq, filename, 
 
 # Main execution
 if __name__ == "__main__":
-    sdr = None
     try:
         if len(sys.argv) > 1:
             duration = float(sys.argv[1])
         else:
             raise ValueError("No duration specified. Please provide the duration in minutes as an argument.")
 
-        ham_bands, freq_step, sample_rate, runs_per_freq = read_config()
-        sdr = RtlSdr()
-        sdr.sample_rate = sample_rate
+        ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type = read_config()
+
+        # Import the appropriate SDR library
+        SdrClass = import_sdr_library(sdr_type)
 
         print(f"Starting IQ data collection for {duration} minutes...")
-        gather_iq_data_parallel(sdr, ham_bands, freq_step, runs_per_freq, 'collected_iq_data.csv', duration)
+        gather_iq_data_parallel(SdrClass, ham_bands, freq_step, runs_per_freq, 'collected_iq_data.csv', duration)
 
     except KeyboardInterrupt:
         print("Data collection interrupted by user.")
     except Exception as e:
         print(f"An error occurred: {e}")
-    finally:
-        if sdr is not None:
-            sdr.close()
-            print("Closed SDR device.")

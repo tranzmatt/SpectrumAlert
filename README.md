@@ -18,6 +18,7 @@
       - [Scenario 3: Multi-device Direction Finding](#scenario-3-multi-device-direction-finding)
   - [Anomaly Detection and Heatmap](#anomaly-detection-and-heatmap)
     - [Heatmap of Suspected Devices and Anomalies:](#heatmap-of-suspected-devices-and-anomalies)
+    - [ToDo](#todo)
     - [License](#license)
 
 ## Features
@@ -100,6 +101,10 @@ One of the core features of **Spectrum Alert** is anomaly detection. The softwar
 - **Direction Finding**: By analyzing the anomalies detected by multiple geographically distributed receivers, the system can triangulate the position of unauthorized transmissions, helping you locate the source of illegal or suspicious activity in the RF spectrum.
 
 This feature makes **Spectrum Alert** a powerful tool for authorities or ham radio enthusiasts who want to identify and take action against illegal spectrum users.
+
+### ToDo
+[x] Create menu
+[] Add support for multiple types of SDRs 
 
 ### License
 
