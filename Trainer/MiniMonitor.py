@@ -5,6 +5,150 @@ from sklearn.ensemble import IsolationForest
 import joblib
 import paho.mqtt.client as mqtt
 import os
+import subprocess
+import socket
+import gpsd
+import json
+import time
+
+def get_gps_coordinates(receiver_lat, receiver_lon):
+    """
+    Retrieves GPS coordinates from gpsd if GPS_SOURCE is set to 'gpsd'.
+    Returns (latitude, longitude, altitude) or (None, None, None) if unavailable.
+    """
+    GPS_SOURCE = os.getenv("GPS_SOURCE", "none").lower()
+
+    if GPS_SOURCE == "fixed":
+        GPS_FIX_ALT = os.getenv("GPS_FIX_ALT", 1)
+        GPS_FIX_LAT = os.getenv("GPS_FIX_LAT", receiver_lat)
+        GPS_FIX_LON = os.getenv("GPS_FIX_LON", receiver_lon)
+        return GPS_FIX_LAT, GPS_FIX_LON, GPS_FIX_ALT
+
+    if GPS_SOURCE == "gpsd":
+        try:
+            # ✅ Connect to gpsd
+            gpsd.connect(host="localhost", port=2947)
+
+            # ✅ Get GPS data
+            gps_data = gpsd.get_current()
+
+            if gps_data is None:
+                print("⚠️ No GPS data available. GPS may not be active.")
+                return None, None, None
+
+            if gps_data.mode >= 2:  # 2D or 3D fix
+                latitude = gps_data.lat
+                longitude = gps_data.lon
+                altitude = gps_data.alt if gps_data.mode == 3 else None  # Altitude available in 3D mode
+                print(f"📍 GPSD Coordinates: {latitude}, {longitude}, Alt: {altitude}m")
+                return latitude, longitude, altitude
+            else:
+                print("⚠️ No GPS fix yet.")
+        except Exception as e:
+            print(f"❌ GPSD Error: {e}")
+    else:
+        print("No available gps source")
+
+    return None, None, None  # Return None if GPS is unavailable
+
+def get_primary_mac():
+    """Retrieves the primary MAC address (uppercase, no colons)."""
+    try:
+        # ✅ Get MAC address using `ip link` (Linux)
+        mac_output = subprocess.check_output("ip link show | grep -m 1 'link/ether' | awk '{print $2}'",
+                                             shell=True, text=True).strip()
+
+        # ✅ Remove colons and convert to uppercase
+        mac_clean = re.sub(r'[:]', '', mac_output).upper()
+
+        return mac_clean
+    except Exception as e:
+        print(f"❌ Error getting MAC address: {e}")
+        return "UNKNOWNMAC"
+
+
+def get_device_name():
+    """
+    Retrieves the device name from environment variable.
+    If unavailable, falls back to 'uname -m' + 'hostname'.
+    """
+
+    # If on Balena
+    device_name = os.getenv("BALENA_DEVICE_NAME_AT_INIT")
+
+    if not device_name:
+        try:
+            host = subprocess.check_output("hostname", shell=True, text=True).strip()
+            mac = get_primary_mac()  # ✅ Get the primary MAC address
+            device_name = f"{host}-{mac}"  # ✅ Append MAC address
+        except Exception as e:
+            print(f"❌ Error getting fallback device name: {e}")
+            device_name = "unknown-device"
+
+    return device_name
+
+
+def setup_mqtt_client(mqtt_broker, mqtt_port):
+    """
+    Initializes and configures the MQTT client using environment variables.
+    Returns a connected MQTT client instance and the MQTT topic.
+    If an error occurs, returns None, None.
+    """
+    try:
+        # ✅ Load environment variables
+        MQTT_BROKER = os.getenv("MQTT_BROKER", mqtt_broker)
+        MQTT_PORT = int(os.getenv("MQTT_PORT", mqtt_port))
+        MQTT_USER = os.getenv("MQTT_USER", None)
+        MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", None)
+
+        # ✅ TLS & CA Certificate Options
+        MQTT_TLS = int(os.getenv("MQTT_TLS", 0))  # 1 = Enable TLS, 0 = Disable
+        MQTT_USE_CA_CERT = int(os.getenv("MQTT_USE_CA_CERT", 0))  # 1 = Use CA Cert, 0 = Disable
+        MQTT_CA_CERT = os.getenv("MQTT_CA_CERT", "/path/to/ca.crt")  # Path to CA Cert
+
+        print(f"📡 Configuring MQTT: {MQTT_BROKER}:{MQTT_PORT} (TLS: {MQTT_TLS}, CA Cert: {MQTT_USE_CA_CERT})")
+
+        # ✅ Create MQTT client
+        mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+
+        # ✅ Enable automatic reconnect
+        mqtt_client.reconnect_delay_set(min_delay=1, max_delay=30)
+
+        # ✅ Use TLS if enabled
+        if MQTT_TLS:
+            print("🔐 Enabling TLS for MQTT...")
+            mqtt_client.tls_set(ca_certs=MQTT_CA_CERT if MQTT_USE_CA_CERT else None)
+
+        # ✅ Define callback functions for connection management
+        def on_connect(client, userdata, flags, rc, properties):
+            if rc == 0:
+                print("✅ MQTT Connected Successfully!")
+            else:
+                print(f"⚠️ MQTT Connection Failed with Code {rc}")
+
+        def on_disconnect(client, userdata, rc, *args):
+            print("❌ MQTT on_disconnect! Trying to reconnect...")
+            try:
+                client.reconnect()
+            except Exception as e:
+                print(f"⚠️ MQTT Reconnect Failed: {e}")
+
+        mqtt_client.on_connect = on_connect
+        mqtt_client.on_disconnect = on_disconnect
+
+        # ✅ Set username/password if provided
+        mqtt_client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
+
+        # ✅ Connect to MQTT broker
+        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        print("✅ Connected to MQTT broker successfully!")
+
+        return mqtt_client  # ✅ Return client
+
+    except Exception as e:
+        print(f"❌ MQTT Setup Error: {e}")
+        return None, None  # ✅ Ensure `None` is returned on error
+
 
 # Function to read and parse the config file
 def read_config(config_file='Trainer/config.ini'):
@@ -36,7 +180,8 @@ def read_config(config_file='Trainer/config.ini'):
         'coordinates': config['MQTT']['topic_coordinates']
     }
 
-    return ham_bands, freq_step, sample_rate, runs_per_freq, receiver_lat, receiver_lon, mqtt_broker, mqtt_port, mqtt_topics
+    return (ham_bands, freq_step, sample_rate, runs_per_freq, receiver_lat, receiver_lon,
+            mqtt_broker, mqtt_port, mqtt_topics)
 
 # Function to load the pre-trained anomaly detection model
 def load_anomaly_detection_model(model_file='anomaly_detection_model_lite.pkl'):
@@ -73,7 +218,8 @@ def setup_mqtt(broker, port):
     client.connect(broker, port, 60)
     return client
 
-def monitor_spectrum_lite(sdr, anomaly_model, mqtt_client, ham_bands, freq_step, sample_rate, runs_per_freq, mqtt_topics, receiver_lat, receiver_lon):
+def monitor_spectrum_lite(sdr, anomaly_model, ham_bands, freq_step, sample_rate,
+                          runs_per_freq, mqtt_client, mqtt_topics, receiver_lat, receiver_lon):
     # Get the number of features the anomaly_model expects
     try:
         expected_num_features = anomaly_model.estimators_[0].n_features_in_
@@ -108,7 +254,8 @@ def monitor_spectrum_lite(sdr, anomaly_model, mqtt_client, ham_bands, freq_step,
 if __name__ == "__main__":
     try:
         # Load the configuration
-        ham_bands, freq_step, sample_rate, runs_per_freq, receiver_lat, receiver_lon, mqtt_broker, mqtt_port, mqtt_topics = read_config()
+        (ham_bands, freq_step, sample_rate, runs_per_freq, receiver_lat, receiver_lon,
+         mqtt_broker, mqtt_port, mqtt_topics) = read_config()
 
         # Load the pre-trained anomaly detection model
         anomaly_model = load_anomaly_detection_model('anomaly_detection_model_lite.pkl')
@@ -119,11 +266,13 @@ if __name__ == "__main__":
         sdr.gain = 'auto'
 
         # Setup MQTT client
-        mqtt_client = setup_mqtt(mqtt_broker, mqtt_port)
-        mqtt_client.loop_start()
+        mqtt_client = setup_mqtt_client(mqtt_broker, mqtt_port)
+        if mqtt_client is None:
+            print("⚠️ MQTT setup failed. Skipping MQTT publishing.")
 
         # Monitor the ham bands for anomalies and report results to MQTT
-        monitor_spectrum_lite(sdr, anomaly_model, mqtt_client, ham_bands, freq_step, sample_rate, runs_per_freq, mqtt_topics, receiver_lat, receiver_lon)
+        monitor_spectrum_lite(sdr, anomaly_model, ham_bands, freq_step, sample_rate, runs_per_freq,
+                              mqtt_client, mqtt_topics, receiver_lat, receiver_lon)
 
     except KeyboardInterrupt:
         print("Monitoring stopped by user.")

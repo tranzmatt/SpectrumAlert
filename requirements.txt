@@ -1,0 +1,6 @@
+scikit-learn==1.2.2
+numpy<2
+pyrtlsdr
+configparser
+paho-mqtt
+joblib
