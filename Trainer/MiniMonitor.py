@@ -1,27 +1,30 @@
+import sys
+import os
+import subprocess
+import re
+import datetime
+import time
 import numpy as np
 import configparser
 from rtlsdr import RtlSdr
-from sklearn.ensemble import IsolationForest
 import joblib
 import paho.mqtt.client as mqtt
-import os
-import subprocess
-import socket
 import gpsd
 import json
-import time
+from sklearn.ensemble import IsolationForest
 
-def get_gps_coordinates(receiver_lat, receiver_lon):
+def get_gps_coordinates():
     """
     Retrieves GPS coordinates from gpsd if GPS_SOURCE is set to 'gpsd'.
     Returns (latitude, longitude, altitude) or (None, None, None) if unavailable.
     """
-    GPS_SOURCE = os.getenv("GPS_SOURCE", "none").lower()
+    GPS_SOURCE = os.getenv("GPS_SOURCE", "fixed").lower()
 
     if GPS_SOURCE == "fixed":
         GPS_FIX_ALT = os.getenv("GPS_FIX_ALT", 1)
-        GPS_FIX_LAT = os.getenv("GPS_FIX_LAT", receiver_lat)
-        GPS_FIX_LON = os.getenv("GPS_FIX_LON", receiver_lon)
+        GPS_FIX_LAT = os.getenv("GPS_FIX_LAT", 0)
+        GPS_FIX_LON = os.getenv("GPS_FIX_LON", 0)
+        #print(f"Returning fixed GPS of {GPS_FIX_LAT}, {GPS_FIX_LON}, {GPS_FIX_ALT}")
         return GPS_FIX_LAT, GPS_FIX_LON, GPS_FIX_ALT
 
     if GPS_SOURCE == "gpsd":
@@ -40,7 +43,7 @@ def get_gps_coordinates(receiver_lat, receiver_lon):
                 latitude = gps_data.lat
                 longitude = gps_data.lon
                 altitude = gps_data.alt if gps_data.mode == 3 else None  # Altitude available in 3D mode
-                print(f"📍 GPSD Coordinates: {latitude}, {longitude}, Alt: {altitude}m")
+                #print(f"📍 GPSD Coordinates: {latitude}, {longitude}, Alt: {altitude}m")
                 return latitude, longitude, altitude
             else:
                 print("⚠️ No GPS fix yet.")
@@ -88,7 +91,7 @@ def get_device_name():
     return device_name
 
 
-def setup_mqtt_client(mqtt_broker, mqtt_port):
+def setup_mqtt_client():
     """
     Initializes and configures the MQTT client using environment variables.
     Returns a connected MQTT client instance and the MQTT topic.
@@ -96,10 +99,11 @@ def setup_mqtt_client(mqtt_broker, mqtt_port):
     """
     try:
         # ✅ Load environment variables
-        MQTT_BROKER = os.getenv("MQTT_BROKER", mqtt_broker)
-        MQTT_PORT = int(os.getenv("MQTT_PORT", mqtt_port))
+        MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
+        MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
         MQTT_USER = os.getenv("MQTT_USER", None)
         MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", None)
+        MQTT_TOPIC = os.getenv("MQTT_TOPIC", "spectrum/anomaly")
 
         # ✅ TLS & CA Certificate Options
         MQTT_TLS = int(os.getenv("MQTT_TLS", 0))  # 1 = Enable TLS, 0 = Disable
@@ -143,7 +147,7 @@ def setup_mqtt_client(mqtt_broker, mqtt_port):
         mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
         print("✅ Connected to MQTT broker successfully!")
 
-        return mqtt_client  # ✅ Return client
+        return mqtt_client, MQTT_TOPIC  # ✅ Return client
 
     except Exception as e:
         print(f"❌ MQTT Setup Error: {e}")
@@ -167,21 +171,7 @@ def read_config(config_file='Trainer/config.ini'):
     sample_rate = float(config['GENERAL']['sample_rate'])
     runs_per_freq = int(config['GENERAL']['runs_per_freq'])
 
-    # Parse receiver settings
-    receiver_lat = float(config['RECEIVER']['latitude'])
-    receiver_lon = float(config['RECEIVER']['longitude'])
-
-    # Parse MQTT settings
-    mqtt_broker = config['MQTT']['broker']
-    mqtt_port = int(config['MQTT']['port'])
-    mqtt_topics = {
-        'anomalies': config['MQTT']['topic_anomalies'],
-        'signal_strength': config['MQTT']['topic_signal_strength'],
-        'coordinates': config['MQTT']['topic_coordinates']
-    }
-
-    return (ham_bands, freq_step, sample_rate, runs_per_freq, receiver_lat, receiver_lon,
-            mqtt_broker, mqtt_port, mqtt_topics)
+    return (ham_bands, freq_step, sample_rate, runs_per_freq)
 
 # Function to load the pre-trained anomaly detection model
 def load_anomaly_detection_model(model_file='anomaly_detection_model_lite.pkl'):
@@ -212,14 +202,10 @@ def calculate_signal_strength(iq_data):
     signal_strength_db = 10 * np.log10(np.mean(amplitude**2))
     return signal_strength_db
 
-# MQTT client setup
-def setup_mqtt(broker, port):
-    client = mqtt.Client()
-    client.connect(broker, port, 60)
-    return client
 
-def monitor_spectrum_lite(sdr, anomaly_model, ham_bands, freq_step, sample_rate,
-                          runs_per_freq, mqtt_client, mqtt_topics, receiver_lat, receiver_lon):
+def monitor_spectrum_lite(sdr, anomaly_model, ham_bands, freq_step, sample_rate, runs_per_freq, mqtt_client, mqtt_topic):
+
+    print(f"our topic is {mqtt_topic}")
     # Get the number of features the anomaly_model expects
     try:
         expected_num_features = anomaly_model.estimators_[0].n_features_in_
@@ -240,22 +226,56 @@ def monitor_spectrum_lite(sdr, anomaly_model, ham_bands, freq_step, sample_rate,
                     if len(features) == expected_num_features:
                         is_anomaly = anomaly_model.predict([features])[0] == -1
                         if is_anomaly:
-                            print(f"Anomaly detected at {current_freq / 1e6:.2f} MHz")
-                            mqtt_client.publish(mqtt_topics['anomalies'], f"Anomaly at {current_freq / 1e6:.2f} MHz")
+                            freq_data = {}
+                            #print(f"Anomaly at {current_freq / 1e6:.2f} MHz")
+                            freq_data['anomaly_freq_mhz'] = (current_freq / 1e6)
+                            freq_data['signal_strength'] = signal_strength_db
 
-                        freq_mhz = current_freq / 1e6
-                        mqtt_client.publish(mqtt_topics['signal_strength'], f"{signal_strength_db:.2f} dB")
-                        mqtt_client.publish(mqtt_topics['coordinates'], f"Latitude: {receiver_lat}, Longitude: {receiver_lon}")
-                        print(f"Monitoring {freq_mhz:.2f} MHz, Signal Strength: {signal_strength_db:.2f} dB")
+                            # ✅ Get UTC detection time
+                            detection_time = datetime.datetime.utcnow().isoformat() + "Z"  # Add "Z" for UTC format
+                            latitude, longitude, altitude = get_gps_coordinates()
+
+                            mqtt_payload = {
+                                "device": device_name,
+                                "detection_time": detection_time,
+                                "gps": {"lat": latitude, "lon": longitude, "alt": altitude},
+                                "data": freq_data
+                            }
+
+                            mqtt_payload_str = json.dumps(mqtt_payload)
+
+                            if mqtt_client:
+                                try:
+                                    publish_info = None
+                                    publish_info: mqtt.MQTTMessageInfo = (
+                                        mqtt_client.publish(mqtt_topic, mqtt_payload_str))
+                                    if publish_info.rc is not None:
+                                        publish_info.wait_for_publish(timeout=10)
+                                        print(f"📤 Published to MQTT topic '{mqtt_topic}':\n{mqtt_payload_str}")
+                                    else:
+                                        print(f"⚠️ MQTT Publish failed: No response received.")
+                                except Exception as e:
+                                    print(f"❌ MQTT Publishing Error: {e}")
+                                    print(f"🔄 Trying to re-establish MQTT connection...")
+                                    try:
+                                        mqtt_client.reconnect()
+                                        time.sleep(2)  # Allow time for reconnection
+                                    except Exception as recon_error:
+                                        print(f"⚠️ MQTT Reconnect Failed: {recon_error}")
+
+                        #freq_mhz = current_freq / 1e6
+                        #mqtt_client.publish(mqtt_topics['signal_strength'], f"{signal_strength_db:.2f} dB")
+                        #mqtt_client.publish(mqtt_topics['coordinates'], f"Latitude: {receiver_lat}, Longitude: {receiver_lon}")
+                        #print(f"Monitoring {freq_mhz:.2f} MHz, Signal Strength: {signal_strength_db:.2f} dB")
 
                 current_freq += freq_step
 
 # Main execution
 if __name__ == "__main__":
     try:
+        device_name = get_device_name()
         # Load the configuration
-        (ham_bands, freq_step, sample_rate, runs_per_freq, receiver_lat, receiver_lon,
-         mqtt_broker, mqtt_port, mqtt_topics) = read_config()
+        (ham_bands, freq_step, sample_rate, runs_per_freq) = read_config()
 
         # Load the pre-trained anomaly detection model
         anomaly_model = load_anomaly_detection_model('anomaly_detection_model_lite.pkl')
@@ -266,13 +286,15 @@ if __name__ == "__main__":
         sdr.gain = 'auto'
 
         # Setup MQTT client
-        mqtt_client = setup_mqtt_client(mqtt_broker, mqtt_port)
+        mqtt_client, mqtt_topic = setup_mqtt_client()
+
         if mqtt_client is None:
-            print("⚠️ MQTT setup failed. Skipping MQTT publishing.")
+            print("❌ MQTT client initialization failed. Exiting...")
+            sys.exit(1)  # Exit the script with a non-zero status to indicate failure
 
         # Monitor the ham bands for anomalies and report results to MQTT
         monitor_spectrum_lite(sdr, anomaly_model, ham_bands, freq_step, sample_rate, runs_per_freq,
-                              mqtt_client, mqtt_topics, receiver_lat, receiver_lon)
+                              mqtt_client, mqtt_topic)
 
     except KeyboardInterrupt:
         print("Monitoring stopped by user.")
