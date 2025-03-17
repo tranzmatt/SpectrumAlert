@@ -1,11 +1,15 @@
 import numpy as np
 import configparser
-from rtlsdr import RtlSdr
 import os
 import csv
 import time
+import sys
 from sklearn.ensemble import IsolationForest
 from sklearn.decomposition import PCA
+import SoapySDR
+from SoapySDR import Device as SoapyDevice
+
+SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_WARNING)  # Suppress INFO messages
 
 # Lite version parameters
 LITE_SAMPLE_SIZE = 128 * 1024  # Reduced sample size for Raspberry Pi
@@ -40,8 +44,10 @@ def read_config(config_file='config.ini'):
     freq_step = float(config['GENERAL'].get('freq_step', 500e3))
     sample_rate = float(config['GENERAL'].get('sample_rate', LITE_SAMPLE_RATE))  # Default to lite sample rate
     runs_per_freq = int(config['GENERAL'].get('runs_per_freq', LITE_RUNS_PER_FREQ))
+    sdr_type = config['GENERAL'].get('sdr_type', 'rtlsdr')
 
-    return ham_bands, freq_step, sample_rate, runs_per_freq
+    return ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type
+
 
 # Lite version of feature extraction with only necessary features
 def extract_features(iq_data):
@@ -73,70 +79,127 @@ def save_data_to_csv(data, filename, header_written):
             writer.writerow(['Frequency', 'Mean_Amplitude', 'Std_Amplitude'])
         writer.writerow(data)
     
-    print(f"Data saved to {filename}")
+    #print(f"Data saved to {filename}")
 
 # Function to gather IQ data and process with reduced features
-def gather_data_lite(sdr, ham_bands, freq_step, runs_per_freq, filename, duration_minutes):
-    header_written = False
-    start_time = time.time()
-    duration_seconds = duration_minutes * 60  # Convert minutes to seconds
+def gather_data_lite(sdr_type, ham_bands, freq_step, runs_per_freq, filename, duration_minutes):
 
-    # Initialize IsolationForest for anomaly detection
-    anomaly_detector = IsolationForest(contamination=0.05, random_state=42)
+    sdr = None
+    try:
 
-    # Fit PCA on some initial data
-    pca_training_data = []
-    for band_start, band_end in ham_bands:
-        sdr.center_freq = band_start
-        iq_samples = sdr.read_samples(LITE_SAMPLE_SIZE)
-        features = extract_features(iq_samples)
-        pca_training_data.append(features)
+        # Enumerate available SDR devices
+        device_dicts = [dict(dev) for dev in SoapyDevice.enumerate()]
+        device_list = [dev for dev in device_dicts if dev['driver'] == sdr_type]
+        device_count = len(device_list)
 
-    pca = PCA(n_components=min(2, len(pca_training_data[0]), len(pca_training_data)))  # Only 2 features
-    pca.fit(pca_training_data)
+        if device_count == 0:
+            raise RuntimeError(f"No available SDR devices of type {sdr_type}")
+        else:
+            print(f"Found {device_count} devices of type {sdr_type}")
+            for i, dev in enumerate(device_list):
+                print(f"Device {i}: {dev}")
 
-    while time.time() - start_time < duration_seconds:
+        # ✅ Assign IDs correctly: `serial` for RTL-SDR, `index` for others
+        if sdr_type == "rtlsdr":
+            device_ids = [dev['serial'] for dev in device_list]  # Use serials for RTL-SDR
+        else:
+            device_ids = [str(i) for i in range(device_count)]  # Use indexes for other SDRs
+
+
+        # ✅ Use `serial` for RTL-SDR, `index` for others
+        if sdr_type == "rtlsdr":
+            sdr = SoapySDR.Device(dict(driver=sdr_type, serial=device_ids[0]))
+            gain_value = 10.0  # Adjust gain manually
+            sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, gain_value)
+        else:
+            sdr = SoapySDR.Device(dict(driver=sdr_type, index=str(device_ids[0])))
+            sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, 'auto')
+
+        header_written = False
+        start_time = time.time()
+        duration_seconds = duration_minutes * 60  # Convert minutes to seconds
+
+        # Initialize IsolationForest for anomaly detection
+        anomaly_detector = IsolationForest(contamination=0.05, random_state=42)
+
+        # Fit PCA on some initial data
+        pca_training_data = []
         for band_start, band_end in ham_bands:
-            current_freq = band_start
-            while current_freq <= band_end:
-                run_features = []
-                for _ in range(runs_per_freq):
-                    sdr.center_freq = current_freq
-                   # sdr.gain = LITE_GAIN  # Use a simplified fixed gain for the lite version
-                    iq_samples = sdr.read_samples(LITE_SAMPLE_SIZE)  # Reduced sample size for efficiency
-                    features = extract_features(iq_samples)
-                    run_features.append(features)
 
-                # Average features over runs
-                avg_features = np.mean(run_features, axis=0)
+            sdr.setFrequency(SoapySDR.SOAPY_SDR_RX, 0, band_start)
+            buff = np.zeros(LITE_SAMPLE_SIZE, dtype=np.complex64)
+            stream = sdr.setupStream(SoapySDR.SOAPY_SDR_RX, SoapySDR.SOAPY_SDR_CF32)
+            sdr.activateStream(stream)
+            sr = sdr.readStream(stream, [buff], len(buff))
 
-                # Apply PCA for dimensionality reduction
-                reduced_features = pca.transform([avg_features])
-                data = [current_freq] + reduced_features[0].tolist()
+            if sr.ret > 0:  # ✅ Only process valid samples
+                iq_samples = buff[:sr.ret]  # ✅ Extract only valid IQ samples
+                features = extract_features(iq_samples)
+                pca_training_data.append(features)
 
-                # Save to CSV
-                save_data_to_csv(data, filename, header_written)
-                header_written = True
+                pca = PCA(n_components=min(2, len(pca_training_data[0]), len(pca_training_data)))  # Only 2 features
+                pca.fit(pca_training_data)
 
-                current_freq += freq_step
+        stream = None
+        while time.time() - start_time < duration_seconds:
+            for band_start, band_end in ham_bands:
+                current_freq = band_start
+                while current_freq <= band_end:
+                    run_features = []
+                    for _ in range(runs_per_freq):
+
+                        sdr.setFrequency(SoapySDR.SOAPY_SDR_RX, 0, current_freq)
+                        buff = np.zeros(LITE_SAMPLE_SIZE, dtype=np.complex64)
+                        stream = sdr.setupStream(SoapySDR.SOAPY_SDR_RX, SoapySDR.SOAPY_SDR_CF32)
+                        sdr.activateStream(stream)
+                        sr = sdr.readStream(stream, [buff], len(buff))
+
+                        if sr.ret > 0:  # ✅ Only process valid samples
+                            iq_samples = buff[:sr.ret]  # ✅ Extract only valid IQ samples
+                            features = extract_features(iq_samples)
+
+                            run_features.append(features)
+
+                    # Average features over runs
+                    avg_features = np.mean(run_features, axis=0)
+
+                    # Apply PCA for dimensionality reduction
+                    reduced_features = pca.transform([avg_features])
+                    data = [current_freq] + reduced_features[0].tolist()
+
+                    # Save to CSV
+                    save_data_to_csv(data, filename, header_written)
+                    header_written = True
+
+                    current_freq += freq_step
+
+        sdr.closeStream(stream)
+        sdr.close()
+        print("Closed SDR device and disconnected from MQTT.")
+
+    except KeyboardInterrupt:
+        sdr.closeStream(stream)
+        sdr.close()
+        print("Closed SDR device and disconnected from MQTT.")
+        sys.exit(0)
+
+
 
 # Main execution
 if __name__ == "__main__":
-    # Read configuration
-    ham_bands, freq_step, sample_rate, runs_per_freq = read_config('Trainer/config.ini')
+    try:
+        # Read configuration
+        ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type = read_config('Trainer/config.ini')
 
-    # Initialize the SDR device
-    sdr = RtlSdr()
-    sdr.sample_rate = sample_rate  # Set sample rate from config file
-    #sdr.gain = LITE_GAIN  # Set initial gain
+        # Get the duration for data gathering from user input
+        duration = input("Enter the duration for data gathering (in minutes): ")
+        duration = float(duration)
 
-    # Get the duration for data gathering from user input
-    duration = input("Enter the duration for data gathering (in minutes): ")
-    duration = float(duration)
+        # Start data gathering
+        gather_data_lite(sdr_type, ham_bands, freq_step, runs_per_freq, 'collected_data_lite.csv', duration)
 
-    # Start data gathering
-    gather_data_lite(sdr, ham_bands, freq_step, runs_per_freq, 'collected_data_lite.csv', duration)
+    except KeyboardInterrupt:
+        sys.exit(0)
 
-    # Close SDR device when done
-    sdr.close()
-    print("Closed SDR device.")
+    except Exception as e:
+        print(f"An error occurred: {e}")

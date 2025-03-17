@@ -6,12 +6,15 @@ import datetime
 import time
 import numpy as np
 import configparser
-from rtlsdr import RtlSdr
 import joblib
 import paho.mqtt.client as mqtt
 import gpsd
 import json
 from sklearn.ensemble import IsolationForest
+import SoapySDR
+from SoapySDR import Device as SoapyDevice
+
+SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_WARNING)  # Suppress INFO messages
 
 def get_gps_coordinates():
     """
@@ -170,8 +173,9 @@ def read_config(config_file='Trainer/config.ini'):
     freq_step = float(config['GENERAL']['freq_step'])
     sample_rate = float(config['GENERAL']['sample_rate'])
     runs_per_freq = int(config['GENERAL']['runs_per_freq'])
+    sdr_type = config['GENERAL'].get('sdr_type', 'rtlsdr')
 
-    return (ham_bands, freq_step, sample_rate, runs_per_freq)
+    return (ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type)
 
 # Function to load the pre-trained anomaly detection model
 def load_anomaly_detection_model(model_file='anomaly_detection_model_lite.pkl'):
@@ -203,7 +207,37 @@ def calculate_signal_strength(iq_data):
     return signal_strength_db
 
 
-def monitor_spectrum_lite(sdr, anomaly_model, ham_bands, freq_step, sample_rate, runs_per_freq, mqtt_client, mqtt_topic):
+def monitor_spectrum_lite(sdr_type, anomaly_model, ham_bands, freq_step, sample_rate, runs_per_freq, mqtt_client, mqtt_topic):
+
+    # Enumerate available SDR devices
+    device_dicts = [dict(dev) for dev in SoapyDevice.enumerate()]
+    device_list = [dev for dev in device_dicts if dev['driver'] == sdr_type]
+    device_count = len(device_list)
+
+    if device_count == 0:
+        raise RuntimeError(f"No available SDR devices of type {sdr_type}")
+    else:
+        print(f"Found {device_count} devices of type {sdr_type}")
+        for i, dev in enumerate(device_list):
+            print(f"Device {i}: {dev}")
+
+    # ✅ Assign IDs correctly: `serial` for RTL-SDR, `index` for others
+    if sdr_type == "rtlsdr":
+        device_ids = [dev['serial'] for dev in device_list]  # Use serials for RTL-SDR
+    else:
+        device_ids = [str(i) for i in range(device_count)]  # Use indexes for other SDRs
+
+
+    # ✅ Use `serial` for RTL-SDR, `index` for others
+    if sdr_type == "rtlsdr":
+        sdr = SoapySDR.Device(dict(driver=sdr_type, serial=device_ids[0]))
+        gain_value = 10.0  # Adjust gain manually
+        sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, gain_value)
+    else:
+        sdr = SoapySDR.Device(dict(driver=sdr_type, index=str(device_ids[0])))
+        sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, 'auto')
+
+
 
     print(f"our topic is {mqtt_topic}")
     # Get the number of features the anomaly_model expects
@@ -212,78 +246,90 @@ def monitor_spectrum_lite(sdr, anomaly_model, ham_bands, freq_step, sample_rate,
     except AttributeError:
         expected_num_features = 2  # We expect 2 features in the lite version
 
-    while True:
-        for band_start, band_end in ham_bands:
-            current_freq = band_start
-            while current_freq <= band_end:
-                for _ in range(runs_per_freq):
-                    sdr.center_freq = current_freq
-                    iq_samples = sdr.read_samples(64 * 1024)  # Reduced sample size for lite version
-                    features = extract_lite_features(iq_samples)
-                    signal_strength_db = calculate_signal_strength(iq_samples)
 
-                    # Ensure we only send the correct number of features
-                    if len(features) == expected_num_features:
-                        is_anomaly = anomaly_model.predict([features])[0] == -1
-                        if is_anomaly:
-                            freq_data = {}
-                            #print(f"Anomaly at {current_freq / 1e6:.2f} MHz")
-                            freq_data['anomaly_freq_mhz'] = (current_freq / 1e6)
-                            freq_data['signal_strength'] = signal_strength_db
+    try:
+        stream = None
+        while True:
+            for band_start, band_end in ham_bands:
+                current_freq = band_start
+                while current_freq <= band_end:
+                    for _ in range(runs_per_freq):
 
-                            # ✅ Get UTC detection time
-                            detection_time = datetime.datetime.utcnow().isoformat() + "Z"  # Add "Z" for UTC format
-                            latitude, longitude, altitude = get_gps_coordinates()
+                        sdr.setFrequency(SoapySDR.SOAPY_SDR_RX, 0, current_freq)
+                        buff = np.zeros(64 * 1024, dtype=np.complex64)
+                        stream = sdr.setupStream(SoapySDR.SOAPY_SDR_RX, SoapySDR.SOAPY_SDR_CF32)
+                        sdr.activateStream(stream)
+                        sr = sdr.readStream(stream, [buff], len(buff))
 
-                            mqtt_payload = {
-                                "device": device_name,
-                                "detection_time": detection_time,
-                                "gps": {"lat": latitude, "lon": longitude, "alt": altitude},
-                                "data": freq_data
-                            }
+                        if sr.ret > 0:  # ✅ Only process valid samples
+                            iq_samples = buff[:sr.ret]  # ✅ Extract only valid IQ samples
+                            features = extract_lite_features(iq_samples)
+                            signal_strength_db = calculate_signal_strength(iq_samples)
 
-                            mqtt_payload_str = json.dumps(mqtt_payload)
 
-                            if mqtt_client:
-                                try:
-                                    publish_info = None
-                                    publish_info: mqtt.MQTTMessageInfo = (
-                                        mqtt_client.publish(mqtt_topic, mqtt_payload_str))
-                                    if publish_info.rc is not None:
-                                        publish_info.wait_for_publish(timeout=10)
-                                        print(f"📤 Published to MQTT topic '{mqtt_topic}':\n{mqtt_payload_str}")
-                                    else:
-                                        print(f"⚠️ MQTT Publish failed: No response received.")
-                                except Exception as e:
-                                    print(f"❌ MQTT Publishing Error: {e}")
-                                    print(f"🔄 Trying to re-establish MQTT connection...")
-                                    try:
-                                        mqtt_client.reconnect()
-                                        time.sleep(2)  # Allow time for reconnection
-                                    except Exception as recon_error:
-                                        print(f"⚠️ MQTT Reconnect Failed: {recon_error}")
+                            # Ensure we only send the correct number of features
+                            if len(features) == expected_num_features:
+                                is_anomaly = anomaly_model.predict([features])[0] == -1
+                                if is_anomaly:
+                                    freq_data = {}
+                                    #print(f"Anomaly at {current_freq / 1e6:.2f} MHz")
+                                    freq_data['anomaly_freq_mhz'] = (current_freq / 1e6)
+                                    freq_data['signal_strength'] = signal_strength_db
 
-                        #freq_mhz = current_freq / 1e6
-                        #mqtt_client.publish(mqtt_topics['signal_strength'], f"{signal_strength_db:.2f} dB")
-                        #mqtt_client.publish(mqtt_topics['coordinates'], f"Latitude: {receiver_lat}, Longitude: {receiver_lon}")
-                        #print(f"Monitoring {freq_mhz:.2f} MHz, Signal Strength: {signal_strength_db:.2f} dB")
+                                    # ✅ Get UTC detection time
+                                    detection_time = datetime.datetime.utcnow().isoformat() + "Z"  # Add "Z" for UTC format
+                                    latitude, longitude, altitude = get_gps_coordinates()
 
-                current_freq += freq_step
+                                    mqtt_payload = {
+                                        "device": device_name,
+                                        "detection_time": detection_time,
+                                        "gps": {"lat": latitude, "lon": longitude, "alt": altitude},
+                                        "data": freq_data
+                                    }
+
+                                    mqtt_payload_str = json.dumps(mqtt_payload)
+
+                                    if mqtt_client:
+                                        try:
+                                            publish_info = None
+                                            publish_info: mqtt.MQTTMessageInfo = (
+                                                mqtt_client.publish(mqtt_topic, mqtt_payload_str))
+                                            if publish_info.rc is not None:
+                                                publish_info.wait_for_publish(timeout=10)
+                                                print(f"📤 Published to MQTT topic '{mqtt_topic}':\n{mqtt_payload_str}")
+                                            else:
+                                                print(f"⚠️ MQTT Publish failed: No response received.")
+                                        except Exception as e:
+                                            print(f"❌ MQTT Publishing Error: {e}")
+                                            print(f"🔄 Trying to re-establish MQTT connection...")
+                                            try:
+                                                mqtt_client.reconnect()
+                                                time.sleep(2)  # Allow time for reconnection
+                                            except Exception as recon_error:
+                                                print(f"⚠️ MQTT Reconnect Failed: {recon_error}")
+
+                    current_freq += freq_step
+
+    except KeyboardInterrupt:
+        print("Monitoring stopped by user.")
+        mqtt_client.disconnect()
+        print(f"MQTT client disconnected")
+
+        sdr.closeStream(stream)
+        sdr.disconnect()
+        sdr.close()
+        print("Closed SDR device and disconnected from MQTT.")
+
 
 # Main execution
 if __name__ == "__main__":
     try:
         device_name = get_device_name()
         # Load the configuration
-        (ham_bands, freq_step, sample_rate, runs_per_freq) = read_config()
+        (ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type) = read_config()
 
         # Load the pre-trained anomaly detection model
         anomaly_model = load_anomaly_detection_model('anomaly_detection_model_lite.pkl')
-
-        # Instantiate RTL-SDR
-        sdr = RtlSdr()
-        sdr.sample_rate = sample_rate
-        sdr.gain = 'auto'
 
         # Setup MQTT client
         mqtt_client, mqtt_topic = setup_mqtt_client()
@@ -293,11 +339,12 @@ if __name__ == "__main__":
             sys.exit(1)  # Exit the script with a non-zero status to indicate failure
 
         # Monitor the ham bands for anomalies and report results to MQTT
-        monitor_spectrum_lite(sdr, anomaly_model, ham_bands, freq_step, sample_rate, runs_per_freq,
+        monitor_spectrum_lite(sdr_type, anomaly_model, ham_bands, freq_step, sample_rate, runs_per_freq,
                               mqtt_client, mqtt_topic)
 
     except KeyboardInterrupt:
-        print("Monitoring stopped by user.")
-        sdr.close()
-        mqtt_client.disconnect()
-        print("Closed SDR device and disconnected from MQTT.")
+        sys.exit(0)
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+

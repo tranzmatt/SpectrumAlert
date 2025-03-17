@@ -1,13 +1,17 @@
-import numpy as np
 import configparser
 import os
 import csv
 import time
-from sklearn.decomposition import PCA
-from concurrent.futures import ThreadPoolExecutor
 import sys
 import threading
-from time import sleep
+import numpy as np
+import SoapySDR
+from sklearn.decomposition import PCA
+from concurrent.futures import ThreadPoolExecutor
+
+from SoapySDR import Device as SoapyDevice
+SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_WARNING)  # Suppress INFO messages
+
 # Thread lock for safe file access
 file_lock = threading.Lock()
 
@@ -45,17 +49,6 @@ def read_config(config_file='Trainer/config.ini'):
     sdr_type = config['GENERAL'].get('sdr_type', 'rtlsdr')
 
     return ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type
-
-# Function to import the necessary SDR library based on the SDR type
-def import_sdr_library(sdr_type):
-    if sdr_type == 'rtlsdr':
-        from rtlsdr import RtlSdr
-        return RtlSdr
-    elif sdr_type in ['limesdr', 'hackrf', 'rsp1a', 'usrp']:
-        from SoapySDR import Device as SoapyDevice
-        return SoapyDevice
-    else:
-        raise ValueError(f"Unsupported SDR type: {sdr_type}")
 
 # Function to extract enhanced features from IQ data
 def extract_features(iq_data):
@@ -150,69 +143,167 @@ def save_data_to_csv(data, filename):
             writer.writerow(data)
 
     print(f"Data saved to {filename}")
-    sleep(10)
-# Function to scan a single band
-def scan_band(sdr_class, band_start, band_end, freq_step, runs_per_freq, filename, pca):
+
+
+
+# Function to scan a single band with a specific SDR device
+def scan_band(device_id, sdr_type, band_start, band_end, freq_step, runs_per_freq, filename, pca):
+    """Scans a frequency band using a specific SDR device."""
+
+    print(f"[Thread-{device_id}] Opening SDR Device {device_id}")
+
+    # ✅ Use `serial` for RTL-SDR, `index` for others
+    if sdr_type == "rtlsdr":
+        sdr = SoapySDR.Device(dict(driver=sdr_type, serial=device_id))
+    else:
+        sdr = SoapySDR.Device(dict(driver=sdr_type, index=str(device_id)))
+
+    print(f"[Thread-{device_id}] Opened SDR Device {device_id}")
+
+    sdr.setSampleRate(SoapySDR.SOAPY_SDR_RX, 0, 2.048e6)  # Set sample rate
+    print(f"[Thread-{device_id}] Setting Sample Rate set")
+
+    try:
+        if sdr_type == "rtlsdr":
+            # RTL-SDR does not support 'auto' gain, set manually
+            gain_value = 10.0  # Adjust gain manually
+            print(f"[Thread-{device_id}] Setting gain to {gain_value}")
+            sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, gain_value)
+        else:
+            # Other SDRs like HackRF, LimeSDR, etc.
+            sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, 'auto')
+            print(f"[Thread-{device_id}] Setting gain to auto")
+    except RuntimeError as e:
+        print(f"[{sdr_type}] Warning: Gain setting failed: {e}")
+
     current_freq = band_start
-    
-    sdr = sdr_class()  # Create separate SDR instance per thread
-    sdr.sample_rate = sample_rate  # Set the sample rate
-    collected_features = []
-    
+
     while current_freq <= band_end:
         run_features = []
         for _ in range(runs_per_freq):
-            sdr.center_freq = current_freq
-            iq_samples = sdr.read_samples(256 * 1024)
-            features = extract_features(iq_samples)
-            run_features.append(features)
+            sdr.setFrequency(SoapySDR.SOAPY_SDR_RX, 0, current_freq)
+            print(f"[Thread-{device_id}] Setting frequency {current_freq}")
 
-        avg_features = np.mean(run_features, axis=0)
-        with threading.Lock():
-            reduced_features = pca.transform([avg_features])  # Thread-safe PCA transformation
-        
-        # Use all original features instead of PCA reduced features for saving
-        data = [current_freq] + avg_features.tolist()  # Add the frequency and all features to the data
-        
-        # Save to CSV
-        save_data_to_csv(data, filename)
-        
-        # Move to the next frequency
-        current_freq += freq_step
-    
-    sdr.close()  # Close the SDR instance after use
+            # ✅ Read IQ samples using SoapySDR stream API
+            buff = np.zeros(256 * 1024, dtype=np.complex64)
+            stream = sdr.setupStream(SoapySDR.SOAPY_SDR_RX, SoapySDR.SOAPY_SDR_CF32)
+            sdr.activateStream(stream)
+            sr = sdr.readStream(stream, [buff], len(buff))
+            print(f"[Thread-{device_id}] Stream Read")
 
-# Main function for parallel processing of bands
-def gather_iq_data_parallel(sdr_class, ham_bands, freq_step, runs_per_freq, filename, duration_minutes):
-    start_time = time.time()
-    duration_seconds = duration_minutes * 60
+            if sr.ret > 0:
+                iq_samples = buff[:sr.ret]
+                features = extract_features(iq_samples)
+                run_features.append(features)
+            else:
+                print(f"[Thread-{device_id}] Warning: No samples at {current_freq} Hz")
 
-    # Collect initial data to fit PCA
+            sdr.deactivateStream(stream)
+            sdr.closeStream(stream)
+            print(f"[Thread-{device_id}] Stream Closed")
+
+        if run_features:
+            avg_features = np.mean(run_features, axis=0)
+            with threading.Lock():
+                reduced_features = pca.transform([avg_features])  # Thread-safe PCA transformation
+
+            # Save to CSV
+            data = [current_freq] + avg_features.tolist()
+            save_data_to_csv(data, filename)
+
+        current_freq += freq_step  # Move to next frequency
+
+    print(f"[Thread-{device_id}] Closing SDR Device {device_id}")
+    sdr = None  # Release SDR
+
+
+def gather_iq_data_parallel(sdr_type, ham_bands, freq_step, runs_per_freq, filename, duration_minutes):
+    """Manages SDR scanning in parallel using multiple devices."""
+
+    # Enumerate available SDR devices
+    device_dicts = [dict(dev) for dev in SoapyDevice.enumerate()]
+    device_list = [dev for dev in device_dicts if dev['driver'] == sdr_type]
+    device_count = len(device_list)
+
+    if device_count == 0:
+        raise RuntimeError(f"No available SDR devices of type {sdr_type}")
+    else:
+        print(f"Found {device_count} devices of type {sdr_type}")
+        for i, dev in enumerate(device_list):
+            print(f"Device {i}: {dev}")
+
+    # ✅ Assign IDs correctly: `serial` for RTL-SDR, `index` for others
+    if sdr_type == "rtlsdr":
+        device_ids = [dev['serial'] for dev in device_list]  # Use serials for RTL-SDR
+    else:
+        device_ids = [str(i) for i in range(device_count)]  # Use indexes for other SDRs
+
+    # Collect initial data to fit PCA (Uses First Available SDR)
+    print(f"gather_iq_data_parallel: Collecting PCA Training Data")
     pca_training_data = []
-    sdr = sdr_class()
-    sdr.sample_rate = sample_rate
-    for band_start, band_end in ham_bands:
-        sdr.center_freq = band_start
-        iq_samples = sdr.read_samples(256 * 1024)
-        features = extract_features(iq_samples)
-        pca_training_data.append(features)
-    sdr.close()
 
+    sdr = SoapySDR.Device(dict(driver=sdr_type, index="0"))  # Open first device for PCA collection
+    sdr.setSampleRate(SoapySDR.SOAPY_SDR_RX, 0, 2.048e6)
+
+    try:
+        if sdr_type == "rtlsdr":
+            # RTL-SDR does not support 'auto' gain, set manually
+            gain_value = 10.0  # Adjust gain manually
+            sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, gain_value)
+            print(f"PCA Collection: Setting gain to {gain_value}")
+        else:
+            # Other SDRs like HackRF, LimeSDR, etc.
+            sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, 'auto')
+            print(f"PCA Collection: Setting gain to auto")
+    except RuntimeError as e:
+        print(f"[{sdr_type}] Warning: Gain setting failed: {e}")
+
+    for band_start, band_end in ham_bands:
+        sdr.setFrequency(SoapySDR.SOAPY_SDR_RX, 0, band_start)
+        buff = np.zeros(256 * 1024, dtype=np.complex64)
+        stream = sdr.setupStream(SoapySDR.SOAPY_SDR_RX, SoapySDR.SOAPY_SDR_CF32)
+        sdr.activateStream(stream)
+        sr = sdr.readStream(stream, [buff], len(buff))
+
+        if sr.ret > 0:
+            iq_samples = buff[:sr.ret]
+            features = extract_features(iq_samples)
+            pca_training_data.append(features)
+        else:
+            print(f"Warning: No samples received for {band_start} Hz")
+
+        sdr.deactivateStream(stream)
+        sdr.closeStream(stream)
+        print(f"PCA Training Data SDR closed")
+
+    sdr = None  # Release PCA SDR
+
+    # Train PCA Model
     num_features = len(pca_training_data[0])
     n_components = min(8, len(pca_training_data), num_features)
-
     pca = PCA(n_components=n_components)
     pca.fit(pca_training_data)
 
+    print(f"gather_iq_data_parallel: Starting Parallel SDR Scanning")
+
     # Parallel scanning of bands
-    with ThreadPoolExecutor() as executor:
+    num_threads = min(device_count, len(ham_bands))  # Limit threads to available SDRs
+
+    print(f"Number of threads: {num_threads} (min {device_count} devices vs {len(ham_bands)} ham_bands)")
+
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
         futures = []
-        for band_start, band_end in ham_bands:
-            futures.append(executor.submit(scan_band, sdr_class, band_start, band_end, freq_step, runs_per_freq, filename, pca))
+        for i, (band_start, band_end) in enumerate(ham_bands):
+            device_id = device_ids[i % device_count]  # Assign a unique device (serial for RTL-SDR, index for others)
+            print(f"Activating thread {device_id}")
+            futures.append(
+                executor.submit(scan_band, device_id, sdr_type, band_start, band_end, freq_step, runs_per_freq,
+                                filename, pca))
 
         # Wait for all threads to finish
         for future in futures:
             future.result()
+
 
 # Main execution
 if __name__ == "__main__":
@@ -224,11 +315,8 @@ if __name__ == "__main__":
 
         ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type = read_config()
 
-        # Import the appropriate SDR library
-        SdrClass = import_sdr_library(sdr_type)
-
         print(f"Starting IQ data collection for {duration} minutes...")
-        gather_iq_data_parallel(SdrClass, ham_bands, freq_step, runs_per_freq, 'collected_iq_data.csv', duration)
+        gather_iq_data_parallel(sdr_type, ham_bands, freq_step, runs_per_freq, 'collected_iq_data.csv', duration)
 
     except KeyboardInterrupt:
         print("Data collection interrupted by user.")
