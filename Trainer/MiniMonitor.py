@@ -1,20 +1,23 @@
-import sys
-import os
-import subprocess
-import re
-import datetime
-import time
-import numpy as np
+import argparse
 import configparser
-import joblib
-import paho.mqtt.client as mqtt
-import gpsd
+import datetime
 import json
-from sklearn.ensemble import IsolationForest
+import os
+import re
+import subprocess
+import sys
+import time
+
 import SoapySDR
+import gpsd
+import joblib
+import numpy as np
+import paho.mqtt.client as mqtt
 from SoapySDR import Device as SoapyDevice
+from sklearn.ensemble import IsolationForest
 
 SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_WARNING)  # Suppress INFO messages
+
 
 def get_gps_coordinates():
     """
@@ -27,7 +30,7 @@ def get_gps_coordinates():
         GPS_FIX_ALT = os.getenv("GPS_FIX_ALT", 1)
         GPS_FIX_LAT = os.getenv("GPS_FIX_LAT", 0)
         GPS_FIX_LON = os.getenv("GPS_FIX_LON", 0)
-        #print(f"Returning fixed GPS of {GPS_FIX_LAT}, {GPS_FIX_LON}, {GPS_FIX_ALT}")
+        # print(f"Returning fixed GPS of {GPS_FIX_LAT}, {GPS_FIX_LON}, {GPS_FIX_ALT}")
         return GPS_FIX_LAT, GPS_FIX_LON, GPS_FIX_ALT
 
     if GPS_SOURCE == "gpsd":
@@ -46,7 +49,7 @@ def get_gps_coordinates():
                 latitude = gps_data.lat
                 longitude = gps_data.lon
                 altitude = gps_data.alt if gps_data.mode == 3 else None  # Altitude available in 3D mode
-                #print(f"📍 GPSD Coordinates: {latitude}, {longitude}, Alt: {altitude}m")
+                # print(f"📍 GPSD Coordinates: {latitude}, {longitude}, Alt: {altitude}m")
                 return latitude, longitude, altitude
             else:
                 print("⚠️ No GPS fix yet.")
@@ -56,6 +59,7 @@ def get_gps_coordinates():
         print("No available gps source")
 
     return None, None, None  # Return None if GPS is unavailable
+
 
 def get_primary_mac():
     """Retrieves the primary MAC address (uppercase, no colons)."""
@@ -160,6 +164,10 @@ def setup_mqtt_client():
 # Function to read and parse the config file
 def read_config(config_file='Trainer/config.ini'):
     config = configparser.ConfigParser()
+
+    if not os.path.exists(config_file):
+        raise FileNotFoundError(f"Config file '{config_file}' not found.")
+
     config.read(config_file)
 
     # Parse HAM bands
@@ -177,6 +185,7 @@ def read_config(config_file='Trainer/config.ini'):
 
     return (ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type)
 
+
 # Function to load the pre-trained anomaly detection model
 def load_anomaly_detection_model(model_file='anomaly_detection_model_lite.pkl'):
     if os.path.exists(model_file):
@@ -187,11 +196,12 @@ def load_anomaly_detection_model(model_file='anomaly_detection_model_lite.pkl'):
         print("No pre-trained anomaly model found. A new model will be created.")
     return model
 
+
 # Lite version of feature extraction with 2 features (to match the trained model)
 def extract_lite_features(iq_data):
     I = np.real(iq_data)
     Q = np.imag(iq_data)
-    amplitude = np.sqrt(I**2 + Q**2)
+    amplitude = np.sqrt(I ** 2 + Q ** 2)
 
     # Basic amplitude statistics
     mean_amplitude = np.mean(amplitude)
@@ -200,14 +210,17 @@ def extract_lite_features(iq_data):
     # Return only 2 features (matching the trained model)
     return [mean_amplitude, std_amplitude]
 
+
 # Function to calculate signal strength (simplified)
 def calculate_signal_strength(iq_data):
     amplitude = np.abs(iq_data)
-    signal_strength_db = 10 * np.log10(np.mean(amplitude**2))
+    signal_strength_db = 10 * np.log10(np.mean(amplitude ** 2))
     return signal_strength_db
 
 
-def monitor_spectrum_lite(sdr_type, anomaly_model, ham_bands, freq_step, sample_rate, runs_per_freq, mqtt_client, mqtt_topic):
+def monitor_spectrum_lite(sdr_type, anomaly_model, ham_bands, freq_step, sample_rate, runs_per_freq, mqtt_client,
+                          mqtt_topic):
+    device_name = get_device_name()
 
     # Enumerate available SDR devices
     device_dicts = [dict(dev) for dev in SoapyDevice.enumerate()]
@@ -227,7 +240,6 @@ def monitor_spectrum_lite(sdr_type, anomaly_model, ham_bands, freq_step, sample_
     else:
         device_ids = [str(i) for i in range(device_count)]  # Use indexes for other SDRs
 
-
     # ✅ Use `serial` for RTL-SDR, `index` for others
     if sdr_type == "rtlsdr":
         sdr = SoapySDR.Device(dict(driver=sdr_type, serial=device_ids[0]))
@@ -237,15 +249,12 @@ def monitor_spectrum_lite(sdr_type, anomaly_model, ham_bands, freq_step, sample_
         sdr = SoapySDR.Device(dict(driver=sdr_type, index=str(device_ids[0])))
         sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, 'auto')
 
-
-
     print(f"our topic is {mqtt_topic}")
     # Get the number of features the anomaly_model expects
     try:
         expected_num_features = anomaly_model.estimators_[0].n_features_in_
     except AttributeError:
         expected_num_features = 2  # We expect 2 features in the lite version
-
 
     try:
         stream = None
@@ -266,13 +275,12 @@ def monitor_spectrum_lite(sdr_type, anomaly_model, ham_bands, freq_step, sample_
                             features = extract_lite_features(iq_samples)
                             signal_strength_db = calculate_signal_strength(iq_samples)
 
-
                             # Ensure we only send the correct number of features
                             if len(features) == expected_num_features:
                                 is_anomaly = anomaly_model.predict([features])[0] == -1
                                 if is_anomaly:
                                     freq_data = {}
-                                    #print(f"Anomaly at {current_freq / 1e6:.2f} MHz")
+                                    # print(f"Anomaly at {current_freq / 1e6:.2f} MHz")
                                     freq_data['anomaly_freq_mhz'] = (current_freq / 1e6)
                                     freq_data['signal_strength'] = signal_strength_db
 
@@ -321,15 +329,31 @@ def monitor_spectrum_lite(sdr_type, anomaly_model, ham_bands, freq_step, sample_
         print("Closed SDR device and disconnected from MQTT.")
 
 
-# Main execution
 if __name__ == "__main__":
     try:
-        device_name = get_device_name()
-        # Load the configuration
-        (ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type) = read_config()
+        # ✅ Use argparse for command-line parsing
+        parser = argparse.ArgumentParser(description="Spectrum Monitoring with SDR.")
+        parser.add_argument("-c", "--config", type=str, default="Trainer/config.ini",
+                            help="Path to the configuration file (default: Trainer/config.ini)")
+        parser.add_argument("-d", "--duration", type=float, default=10,
+                            help="Duration in minutes (default: 10)")
+        parser.add_argument("-a", "--amodel", type=str, default="anomaly_detection_model_lite.pkl",
+                            help="Path to the anomaly detection model (default: anomaly_detection_model_lite.pkl)")
 
-        # Load the pre-trained anomaly detection model
-        anomaly_model = load_anomaly_detection_model('anomaly_detection_model_lite.pkl')
+        args = parser.parse_args()
+
+        # ✅ Extract arguments
+        config_file = args.config
+        duration = args.duration
+        amodel_file = args.amodel
+
+        print(f"Using config file: {config_file}")
+        print(f"Monitoring duration: {duration} minutes")
+        print(f"Using ML model: {amodel_file}")
+
+        # ✅ Call the function with the parsed arguments
+        ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type = read_config(config_file)
+        anomaly_model = load_anomaly_detection_model(amodel_file)
 
         # Setup MQTT client
         mqtt_client, mqtt_topic = setup_mqtt_client()
@@ -347,4 +371,3 @@ if __name__ == "__main__":
 
     except Exception as e:
         print(f"An error occurred: {e}")
-

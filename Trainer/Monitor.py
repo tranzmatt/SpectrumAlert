@@ -1,19 +1,20 @@
-import sys
-import os
-import subprocess
-import re
-import datetime
-import time
-import numpy as np
+import argparse
 import configparser
-from rtlsdr import RtlSdr
-import joblib
-import paho.mqtt.client as mqtt
-import gpsd
+import datetime
 import json
-from sklearn.ensemble import RandomForestClassifier, IsolationForest
+import os
+import re
+import subprocess
+import sys
+import time
+
 import SoapySDR
+import gpsd
+import joblib
+import numpy as np
+import paho.mqtt.client as mqtt
 from SoapySDR import Device as SoapyDevice
+from sklearn.ensemble import RandomForestClassifier, IsolationForest
 
 SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_WARNING)  # Suppress INFO messages
 
@@ -58,6 +59,7 @@ def get_gps_coordinates():
         print("No available gps source")
 
     return None, None, None  # Return None if GPS is unavailable
+
 
 def get_primary_mac():
     """Retrieves the primary MAC address (uppercase, no colons)."""
@@ -158,9 +160,15 @@ def setup_mqtt_client():
         print(f"❌ MQTT Setup Error: {e}")
         return None, None  # ✅ Ensure `None` is returned on error
 
+
 # Function to read and parse the config file
 def read_config(config_file='Trainer/config.ini'):
+
     config = configparser.ConfigParser()
+
+    if not os.path.exists(config_file):
+        raise FileNotFoundError(f"Config file '{config_file}' not found.")
+
     config.read(config_file)
 
     # Parse HAM bands
@@ -178,6 +186,7 @@ def read_config(config_file='Trainer/config.ini'):
 
     return (ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type)
 
+
 # Function to load the pre-trained anomaly detection model
 def load_anomaly_detection_model(model_file='anomaly_detection_model.pkl'):
     if os.path.exists(model_file):
@@ -187,6 +196,7 @@ def load_anomaly_detection_model(model_file='anomaly_detection_model.pkl'):
         model = IsolationForest(contamination=0.05, random_state=42)
         print("No pre-trained anomaly model found. A new model will be created.")
     return model
+
 
 # Function to load the pre-trained RF fingerprinting model (placeholder)
 def load_rf_fingerprinting_model(model_file='rf_fingerprinting_model.pkl'):
@@ -198,10 +208,11 @@ def load_rf_fingerprinting_model(model_file='rf_fingerprinting_model.pkl'):
         print("No pre-trained RF fingerprinting model found. A new model will be created.")
     return model
 
+
 def extract_features(iq_data, target_num_features=None):
     I = np.real(iq_data)
     Q = np.imag(iq_data)
-    amplitude = np.sqrt(I**2 + Q**2)
+    amplitude = np.sqrt(I ** 2 + Q ** 2)
     phase = np.unwrap(np.angle(iq_data))
 
     # Basic features
@@ -219,7 +230,7 @@ def extract_features(iq_data, target_num_features=None):
     kurt_phase = np.mean((phase - np.mean(phase)) ** 4) / (np.std(phase) ** 4)
 
     # Cyclostationary features (simplified)
-    cyclo_autocorr = np.abs(np.correlate(amplitude, amplitude, mode='full')[len(amplitude)//2:]).mean()
+    cyclo_autocorr = np.abs(np.correlate(amplitude, amplitude, mode='full')[len(amplitude) // 2:]).mean()
 
     features = [
         mean_amplitude, std_amplitude, mean_fft_magnitude, std_fft_magnitude,
@@ -237,15 +248,17 @@ def extract_features(iq_data, target_num_features=None):
 
     return features
 
+
 # Function to calculate signal strength (placeholder)
 def calculate_signal_strength(iq_data):
     amplitude = np.abs(iq_data)
-    signal_strength_db = 10 * np.log10(np.mean(amplitude**2))
+    signal_strength_db = 10 * np.log10(np.mean(amplitude ** 2))
     return signal_strength_db
 
 
 def monitor_spectrum(sdr_type, model, anomaly_model, ham_bands, freq_step, sample_rate,
                      runs_per_freq, mqtt_client, mqtt_topic):
+    device_name = get_device_name()
 
     # Enumerate available SDR devices
     device_dicts = [dict(dev) for dev in SoapyDevice.enumerate()]
@@ -264,7 +277,6 @@ def monitor_spectrum(sdr_type, model, anomaly_model, ham_bands, freq_step, sampl
         device_ids = [dev['serial'] for dev in device_list]  # Use serials for RTL-SDR
     else:
         device_ids = [str(i) for i in range(device_count)]  # Use indexes for other SDRs
-
 
     # ✅ Use `serial` for RTL-SDR, `index` for others
     if sdr_type == "rtlsdr":
@@ -305,7 +317,8 @@ def monitor_spectrum(sdr_type, model, anomaly_model, ham_bands, freq_step, sampl
                         is_anomaly = anomaly_model.predict([features])[0] == -1
                         if is_anomaly:
                             freq_data = {}
-                            print(f"Anomaly detected at {current_freq / 1e6:.2f} MHz at {signal_strength_db:.2f} dB at with features: {features}")
+                            print(
+                                f"Anomaly detected at {current_freq / 1e6:.2f} MHz at {signal_strength_db:.2f} dB at with features: {features}")
                             freq_data['anomaly_freq_mhz'] = (current_freq / 1e6)
                             freq_data['signal_strength'] = signal_strength_db
 
@@ -325,7 +338,8 @@ def monitor_spectrum(sdr_type, model, anomaly_model, ham_bands, freq_step, sampl
                             if mqtt_client:
                                 try:
                                     publish_info = None
-                                    publish_info: mqtt.MQTTMessageInfo = mqtt_client.publish(mqtt_topic, mqtt_payload_str)
+                                    publish_info: mqtt.MQTTMessageInfo = mqtt_client.publish(mqtt_topic,
+                                                                                             mqtt_payload_str)
                                     if publish_info.rc is not None:
                                         publish_info.wait_for_publish(timeout=10)
                                         print(f"📤 Published to MQTT topic '{mqtt_topic}':\n{mqtt_payload_str}")
@@ -355,15 +369,34 @@ def monitor_spectrum(sdr_type, model, anomaly_model, ham_bands, freq_step, sampl
 
 # Main execution
 if __name__ == "__main__":
-    device_name = get_device_name()
+
+    mqtt_client = None
 
     try:
-        # Load the configuration
-        (ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type) = read_config()
+        # ✅ Use argparse for command-line parsing
+        parser = argparse.ArgumentParser(description="Spectrum Monitoring with SDR.")
+        parser.add_argument("-c", "--config", type=str, default="Trainer/config.ini",
+                            help="Path to the configuration file (default: Trainer/config.ini)")
+        parser.add_argument("-t", "--duration", type=float, default=10,
+                            help="Duration in minutes (default: 10)")
+        parser.add_argument("-a", "--amodel", type=str, default="anomaly_detection_model_lite.pkl",
+                            help="Path to the machine learning model (default: anomaly_detection_model_lite.pkl)")
+        parser.add_argument("-r", "--rfmodel", type=str, default="rf_fingerprinting_model.pkl",
+                            help="Path to the machine learning model (default: rf_fingerprinting_model.pkl)")
+
+        args = parser.parse_args()
+
+        # ✅ Extract arguments
+        config_file = args.config
+        duration = args.duration
+        amodel_file = args.amodel
+        rf_model_file = args.rfmodel
+
+        ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type = read_config(config_file)
 
         # Load the pre-trained RF fingerprinting and anomaly detection models
-        anomaly_model = load_anomaly_detection_model('anomaly_detection_model.pkl')
-        rf_model = load_rf_fingerprinting_model('rf_fingerprinting_model.pkl')
+        anomaly_model = load_anomaly_detection_model(amodel_file)
+        rf_model = load_rf_fingerprinting_model(rf_model_file)
 
         # Setup MQTT client
         mqtt_client, mqtt_topic = setup_mqtt_client()
@@ -372,12 +405,12 @@ if __name__ == "__main__":
             print("❌ MQTT client initialization failed. Exiting...")
             sys.exit(1)  # Exit the script with a non-zero status to indicate failure
 
-
         # Monitor the ham bands for anomalies and report results to MQTT
         monitor_spectrum(sdr_type, rf_model, anomaly_model, ham_bands, freq_step, sample_rate, runs_per_freq,
                          mqtt_client, mqtt_topic)
 
     except KeyboardInterrupt:
         print("Monitoring stopped by user.")
-        mqtt_client.disconnect()
+        if mqtt_client:
+            mqtt_client.disconnect()
         print("Closed SDR device and disconnected from MQTT.")

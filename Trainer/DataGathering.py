@@ -1,15 +1,15 @@
+import argparse
 import configparser
-import os
 import csv
-import time
-import sys
+import os
 import threading
-import numpy as np
-import SoapySDR
-from sklearn.decomposition import PCA
 from concurrent.futures import ThreadPoolExecutor
 
+import SoapySDR
+import numpy as np
 from SoapySDR import Device as SoapyDevice
+from sklearn.decomposition import PCA
+
 SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_WARNING)  # Suppress INFO messages
 
 # Thread lock for safe file access
@@ -19,13 +19,14 @@ file_lock = threading.Lock()
 header_lock = threading.Lock()
 header_written = False
 
+
 # Function to read and parse the config file
 def read_config(config_file='Trainer/config.ini'):
     config = configparser.ConfigParser()
 
     if not os.path.exists(config_file):
         raise FileNotFoundError(f"Config file '{config_file}' not found.")
-    
+
     config.read(config_file)
 
     if 'HAM_BANDS' not in config:
@@ -34,7 +35,7 @@ def read_config(config_file='Trainer/config.ini'):
     ham_bands_str = config['HAM_BANDS'].get('bands', None)
     if ham_bands_str is None:
         raise ValueError("Missing 'bands' entry in 'HAM_BANDS' section.")
-    
+
     ham_bands = []
     for band in ham_bands_str.split(','):
         try:
@@ -50,11 +51,12 @@ def read_config(config_file='Trainer/config.ini'):
 
     return ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type
 
+
 # Function to extract enhanced features from IQ data
 def extract_features(iq_data):
     I = np.real(iq_data)
     Q = np.imag(iq_data)
-    amplitude = np.sqrt(I**2 + Q**2)  # Magnitude of the complex signal
+    amplitude = np.sqrt(I ** 2 + Q ** 2)  # Magnitude of the complex signal
     phase = np.unwrap(np.angle(iq_data))  # Unwrap the phase
 
     # FFT of the signal
@@ -120,6 +122,7 @@ def extract_features(iq_data):
         spectral_entropy, papr, band_energy_ratio
     ]
 
+
 # Function to save the collected data as a CSV
 def save_data_to_csv(data, filename):
     global header_written
@@ -133,17 +136,17 @@ def save_data_to_csv(data, filename):
 
             with header_lock:
                 if not header_written:
-                    writer.writerow(['Frequency', 'Mean_Amplitude', 'Std_Amplitude', 'Mean_FFT_Magnitude', 'Std_FFT_Magnitude',
-                                     'Skew_Amplitude', 'Kurt_Amplitude', 'Skew_Phase', 'Kurt_Phase', 'Cyclo_Autocorr',
-                                     'Spectral_Entropy', 'PAPR', 'Band_Energy_Ratio'])
+                    writer.writerow(
+                        ['Frequency', 'Mean_Amplitude', 'Std_Amplitude', 'Mean_FFT_Magnitude', 'Std_FFT_Magnitude',
+                         'Skew_Amplitude', 'Kurt_Amplitude', 'Skew_Phase', 'Kurt_Phase', 'Cyclo_Autocorr',
+                         'Spectral_Entropy', 'PAPR', 'Band_Energy_Ratio'])
                     header_written = True  # Update the flag after writing the header
-            
+
             # Debug: Print the data being written to the CSV
             print(f"Writing to CSV: {data}")
             writer.writerow(data)
 
     print(f"Data saved to {filename}")
-
 
 
 # Function to scan a single band with a specific SDR device
@@ -305,15 +308,25 @@ def gather_iq_data_parallel(sdr_type, ham_bands, freq_step, runs_per_freq, filen
             future.result()
 
 
-# Main execution
 if __name__ == "__main__":
     try:
-        if len(sys.argv) > 1:
-            duration = float(sys.argv[1])
-        else:
-            raise ValueError("No duration specified. Please provide the duration in minutes as an argument.")
+        # ✅ Use argparse for command-line parsing
+        parser = argparse.ArgumentParser(description="Spectrum Monitoring with SDR.")
+        parser.add_argument("-c", "--config", type=str, default="Trainer/config.ini",
+                            help="Path to the configuration file (default: Trainer/config.ini)")
+        parser.add_argument("-d", "--duration", type=float, default=10,
+                            help="Duration in minutes (default: 10)")
 
-        ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type = read_config()
+        args = parser.parse_args()
+
+        # ✅ Extract arguments
+        config_file = args.config
+        duration = args.duration
+
+        print(f"Using config file: {config_file}")
+        print(f"Monitoring duration: {duration} minutes")
+
+        ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type = read_config(config_file)
 
         print(f"Starting IQ data collection for {duration} minutes...")
         gather_iq_data_parallel(sdr_type, ham_bands, freq_step, runs_per_freq, 'collected_iq_data.csv', duration)

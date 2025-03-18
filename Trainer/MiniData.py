@@ -1,29 +1,32 @@
-import numpy as np
+import argparse
 import configparser
-import os
 import csv
-import time
+import os
 import sys
-from sklearn.ensemble import IsolationForest
-from sklearn.decomposition import PCA
+import time
+
 import SoapySDR
+import numpy as np
 from SoapySDR import Device as SoapyDevice
+from sklearn.decomposition import PCA
+from sklearn.ensemble import IsolationForest
 
 SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_WARNING)  # Suppress INFO messages
 
 # Lite version parameters
 LITE_SAMPLE_SIZE = 128 * 1024  # Reduced sample size for Raspberry Pi
-LITE_SAMPLE_RATE = 1.024e6     # Reduced sample rate for efficiency
-LITE_RUNS_PER_FREQ = 3         # Fewer runs per frequency to save resources
-#LITE_GAIN = 20                 # Simplified fixed gain for the lite version
+LITE_SAMPLE_RATE = 1.024e6  # Reduced sample rate for efficiency
+LITE_RUNS_PER_FREQ = 3  # Fewer runs per frequency to save resources
+# LITE_GAIN = 20                 # Simplified fixed gain for the lite version
 
 # Function to read configuration file
 def read_config(config_file='config.ini'):
+
     config = configparser.ConfigParser()
 
     if not os.path.exists(config_file):
         raise FileNotFoundError(f"Config file '{config_file}' not found.")
-    
+
     config.read(config_file)
 
     if 'HAM_BANDS' not in config:
@@ -32,7 +35,7 @@ def read_config(config_file='config.ini'):
     ham_bands_str = config['HAM_BANDS'].get('bands', None)
     if ham_bands_str is None:
         raise ValueError("Missing 'bands' entry in 'HAM_BANDS' section.")
-    
+
     ham_bands = []
     for band in ham_bands_str.split(','):
         try:
@@ -53,7 +56,7 @@ def read_config(config_file='config.ini'):
 def extract_features(iq_data):
     I = np.real(iq_data)
     Q = np.imag(iq_data)
-    amplitude = np.sqrt(I**2 + Q**2)
+    amplitude = np.sqrt(I ** 2 + Q ** 2)
 
     # Basic features: amplitude
     mean_amplitude = np.mean(amplitude)
@@ -67,23 +70,24 @@ def extract_features(iq_data):
         mean_amplitude, std_amplitude
     ]
 
+
 # Function to save the collected data as a CSV
 def save_data_to_csv(data, filename, header_written):
     directory = os.path.dirname(filename)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    
+
     with open(filename, 'a', newline='') as f:
         writer = csv.writer(f)
         if not header_written:
             writer.writerow(['Frequency', 'Mean_Amplitude', 'Std_Amplitude'])
         writer.writerow(data)
-    
-    #print(f"Data saved to {filename}")
+
+    # print(f"Data saved to {filename}")
+
 
 # Function to gather IQ data and process with reduced features
 def gather_data_lite(sdr_type, ham_bands, freq_step, runs_per_freq, filename, duration_minutes):
-
     sdr = None
     try:
 
@@ -104,7 +108,6 @@ def gather_data_lite(sdr_type, ham_bands, freq_step, runs_per_freq, filename, du
             device_ids = [dev['serial'] for dev in device_list]  # Use serials for RTL-SDR
         else:
             device_ids = [str(i) for i in range(device_count)]  # Use indexes for other SDRs
-
 
         # ✅ Use `serial` for RTL-SDR, `index` for others
         if sdr_type == "rtlsdr":
@@ -184,16 +187,26 @@ def gather_data_lite(sdr_type, ham_bands, freq_step, runs_per_freq, filename, du
         sys.exit(0)
 
 
-
-# Main execution
 if __name__ == "__main__":
     try:
-        # Read configuration
-        ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type = read_config('Trainer/config.ini')
+        # ✅ Use argparse for command-line parsing
+        parser = argparse.ArgumentParser(description="Spectrum Monitoring with SDR.")
+        parser.add_argument("-c", "--config", type=str, default="Trainer/config.ini",
+                            help="Path to the configuration file (default: Trainer/config.ini)")
+        parser.add_argument("-d", "--duration", type=float, default=10,
+                            help="Duration in minutes (default: 10)")
 
-        # Get the duration for data gathering from user input
-        duration = input("Enter the duration for data gathering (in minutes): ")
-        duration = float(duration)
+        args = parser.parse_args()
+
+        # ✅ Extract arguments
+        config_file = args.config
+        duration = args.duration
+
+        print(f"Using config file: {config_file}")
+        print(f"Monitoring duration: {duration} minutes")
+
+        # ✅ Call the function with the parsed arguments
+        ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type = read_config(config_file)
 
         # Start data gathering
         gather_data_lite(sdr_type, ham_bands, freq_step, runs_per_freq, 'collected_data_lite.csv', duration)
