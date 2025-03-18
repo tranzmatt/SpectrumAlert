@@ -195,21 +195,26 @@ if __name__ == "__main__":
                             help="Path to the configuration file (default: Trainer/config.ini)")
         parser.add_argument("-d", "--duration", type=float, default=10,
                             help="Duration in minutes (default: 10)")
+        parser.add_argument("-o", "--output", type=str, default="collected_data_lite.csv",
+                            help="Path to the output file (default: collected_data_lite.csv)")
+
 
         args = parser.parse_args()
 
         # ✅ Extract arguments
         config_file = args.config
         duration = args.duration
+        output_file = args.output
 
         print(f"Using config file: {config_file}")
         print(f"Monitoring duration: {duration} minutes")
+        print(f"Saving to: {output_file}")
 
         # ✅ Call the function with the parsed arguments
         ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type = read_config(config_file)
 
         # Start data gathering
-        gather_data_lite(sdr_type, ham_bands, freq_step, runs_per_freq, 'collected_data_lite.csv', duration)
+        gather_data_lite(sdr_type, ham_bands, freq_step, runs_per_freq, output_file, duration)
 
     except KeyboardInterrupt:
         sys.exit(0)
