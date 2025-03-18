@@ -1,11 +1,15 @@
+import argparse
+import csv
+import os
+import sys
+from collections import Counter
+
+import joblib
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier, IsolationForest
-from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
 from sklearn.metrics import accuracy_score, classification_report
-from collections import Counter
-import joblib
-import os
-import csv
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+
 
 # Function to handle loading CSV data into features
 def load_data_from_csv(filename):
@@ -20,6 +24,7 @@ def load_data_from_csv(filename):
             features.append([float(value) for value in row[1:]])  # Extracting feature data
 
     return np.array(features)
+
 
 # Lite version of the RF fingerprinting model
 def train_rf_fingerprinting_model(features):
@@ -44,7 +49,7 @@ def train_rf_fingerprinting_model(features):
     # Simple RandomForestClassifier
     model = RandomForestClassifier(
         n_estimators=50,  # Reduced number of trees for faster training
-        max_depth=10,     # Reduced depth for lower complexity
+        max_depth=10,  # Reduced depth for lower complexity
         random_state=42
     )
 
@@ -72,33 +77,57 @@ def train_rf_fingerprinting_model(features):
 
     return model, anomaly_detector
 
+
 # Function to save the trained models to files
 def save_model_to_file(model, filename='rf_fingerprinting_model_lite.pkl'):
     joblib.dump(model, filename)
     print(f"Model saved to {filename}")
 
+
 def save_anomaly_model_to_file(model, filename='anomaly_detection_model_lite.pkl'):
     joblib.dump(model, filename)
     print(f"Anomaly detection model saved to {filename}")
 
-# Main execution
+
 if __name__ == "__main__":
-    # Load the collected data from the CSV file
-    data_file = 'collected_data_lite.csv'  # Lite version data
-    print(f"Loading data from {data_file}...")
-
     try:
-        features = load_data_from_csv(data_file)
-        print(f"Sample features (first 5): {features[:5]}")  # Debugging statement
+        # ✅ Use argparse for command-line parsing
+        parser = argparse.ArgumentParser(description="Spectrum Monitoring with SDR.")
+        parser.add_argument("-i", "--input", type=str, default="collected_data_lite.csv",
+                            help="Path to the collected lite data file (default: collected_data_lite.csv)")
+        parser.add_argument("-a", "--anomaly", type=str, default="anomaly_detection_model_lite.pkl",
+                            help="Path to the output lite anomaly file (default: anomaly_detection_model_lite.pkl)")
+        parser.add_argument("-f", "--fingerprint", type=str, default="rf_fingerprinting_model_lite.pkl",
+                            help="Path to the output lite fingerprint file (default: rf_fingerprinting_model_lite.pkl)")
+
+        args = parser.parse_args()
+
+        input_file = args.input
+        fingerprint_model_file = args.fingerprint
+        anomaly_detection_model_file = args.anomaly
+
+        print(f"Loading data from {input_file}...")
+
+        try:
+            features = load_data_from_csv(input_file)
+            print(f"Sample features (first 5): {features[:5]}")  # Debugging statement
+        except Exception as e:
+            print(f"Error loading data: {e}")
+            exit(1)
+
+        # Train the RF fingerprinting and anomaly detection models
+        fingerprint_model, anomaly_model = train_rf_fingerprinting_model(features)
+
+        print(f"Saving to {fingerprint_model_file} / {anomaly_detection_model_file}...")
+
+        # Save the trained models to files for future use
+        if fingerprint_model is not None:
+            save_model_to_file(fingerprint_model, fingerprint_model_file)
+        if anomaly_model is not None:
+            save_anomaly_model_to_file(anomaly_model, anomaly_detection_model_file)
+
+    except KeyboardInterrupt:
+        sys.exit(0)
+
     except Exception as e:
-        print(f"Error loading data: {e}")
-        exit(1)
-
-    # Train the RF fingerprinting and anomaly detection models
-    model, anomaly_model = train_rf_fingerprinting_model(features)
-
-    # Save the trained models to files for future use
-    if model is not None:
-        save_model_to_file(model, 'rf_fingerprinting_model_lite.pkl')
-    if anomaly_model is not None:
-        save_anomaly_model_to_file(anomaly_model, 'anomaly_detection_model_lite.pkl')
+        print(f"An error occurred: {e}")
