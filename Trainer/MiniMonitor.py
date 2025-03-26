@@ -182,8 +182,10 @@ def read_config(config_file='Trainer/config.ini'):
     sample_rate = float(config['GENERAL']['sample_rate'])
     runs_per_freq = int(config['GENERAL']['runs_per_freq'])
     sdr_type = config['GENERAL'].get('sdr_type', 'rtlsdr')
+    min_db = float(config['GENERAL']['min_db'])
+    gain_value = float(config['GENERAL'].get('gain_value', 20.0))
 
-    return (ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type)
+    return ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type, min_db, gain_value
 
 
 # Function to load the pre-trained anomaly detection model
@@ -218,36 +220,8 @@ def calculate_signal_strength(iq_data):
     return signal_strength_db
 
 
-def monitor_spectrum_lite(sdr_type, anomaly_model, ham_bands, freq_step, sample_rate, runs_per_freq, mqtt_client,
-                          mqtt_topic):
-    device_name = get_device_name()
-
-    # Enumerate available SDR devices
-    device_dicts = [dict(dev) for dev in SoapyDevice.enumerate()]
-    device_list = [dev for dev in device_dicts if dev['driver'] == sdr_type]
-    device_count = len(device_list)
-
-    if device_count == 0:
-        raise RuntimeError(f"No available SDR devices of type {sdr_type}")
-    else:
-        print(f"Found {device_count} devices of type {sdr_type}")
-        for i, dev in enumerate(device_list):
-            print(f"Device {i}: {dev}")
-
-    # ✅ Assign IDs correctly: `serial` for RTL-SDR, `index` for others
-    if sdr_type == "rtlsdr":
-        device_ids = [dev['serial'] for dev in device_list]  # Use serials for RTL-SDR
-    else:
-        device_ids = [str(i) for i in range(device_count)]  # Use indexes for other SDRs
-
-    # ✅ Use `serial` for RTL-SDR, `index` for others
-    if sdr_type == "rtlsdr":
-        sdr = SoapySDR.Device(dict(driver=sdr_type, serial=device_ids[0]))
-        gain_value = 10.0  # Adjust gain manually
-        sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, gain_value)
-    else:
-        sdr = SoapySDR.Device(dict(driver=sdr_type, index=str(device_ids[0])))
-        sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, 'auto')
+def monitor_spectrum_lite(sdr_type, anomaly_model, ham_bands, freq_step, sample_rate, runs_per_freq,
+                          min_db, gain_value, mqtt_client, mqtt_topic):
 
     print(f"our topic is {mqtt_topic}")
     # Get the number of features the anomaly_model expects
@@ -258,16 +232,55 @@ def monitor_spectrum_lite(sdr_type, anomaly_model, ham_bands, freq_step, sample_
 
     try:
         stream = None
+        device_name = get_device_name()
+
+        # Enumerate available SDR devices
+        device_dicts = [dict(dev) for dev in SoapyDevice.enumerate()]
+        device_list = [dev for dev in device_dicts if dev['driver'] == sdr_type]
+        device_count = len(device_list)
+
+        if device_count == 0:
+            raise RuntimeError(f"No available SDR devices of type {sdr_type}")
+        else:
+            print(f"Found {device_count} devices of type {sdr_type}")
+            for i, dev in enumerate(device_list):
+                print(f"Device {i}: {dev}")
+
+        sdr = None
+        # ✅ Use `serial` for RTL-SDR, `index` for others
+        if sdr_type == "rtlsdr":
+            device_ids = [dev['serial'] for dev in device_list]  # Use serials for RTL-SDR
+            sdr = SoapySDR.Device(dict(driver=sdr_type, serial=device_ids[0]))
+            if sdr is None:
+                raise RuntimeError(f"No available devices of type {sdr_type}")
+                sys.exit(0)
+            sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, gain_value)
+        else:
+            device_ids = [str(i) for i in range(device_count)]  # Use indexes for other SDRs
+            sdr = SoapySDR.Device(dict(driver=sdr_type, index=str(device_ids[0])))
+            if sdr is None:
+                raise RuntimeError(f"No available devices of type {sdr_type}")
+                sys.exit(0)
+            try:
+                gain_names = sdr.listGains(SoapySDR.SOAPY_SDR_RX, 0)
+                for name in gain_names:
+                    sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, name, gain_value)
+            except Exception as e:
+                print(f"Warning: Failed to set gain: {e}")
+
+
+        stream = sdr.setupStream(SoapySDR.SOAPY_SDR_RX, SoapySDR.SOAPY_SDR_CF32)
+        sdr.activateStream(stream)
+
         while True:
             for band_start, band_end in ham_bands:
                 current_freq = band_start
+                print(f"Current freq: {current_freq}")
                 while current_freq <= band_end:
                     for _ in range(runs_per_freq):
 
                         sdr.setFrequency(SoapySDR.SOAPY_SDR_RX, 0, current_freq)
                         buff = np.zeros(64 * 1024, dtype=np.complex64)
-                        stream = sdr.setupStream(SoapySDR.SOAPY_SDR_RX, SoapySDR.SOAPY_SDR_CF32)
-                        sdr.activateStream(stream)
                         sr = sdr.readStream(stream, [buff], len(buff))
 
                         if sr.ret > 0:  # ✅ Only process valid samples
@@ -275,14 +288,16 @@ def monitor_spectrum_lite(sdr_type, anomaly_model, ham_bands, freq_step, sample_
                             features = extract_lite_features(iq_samples)
                             signal_strength_db = calculate_signal_strength(iq_samples)
 
+                            if signal_strength_db < min_db:
+                                continue
+
                             # Ensure we only send the correct number of features
                             if len(features) == expected_num_features:
                                 is_anomaly = anomaly_model.predict([features])[0] == -1
                                 if is_anomaly:
-                                    freq_data = {}
-                                    # print(f"Anomaly at {current_freq / 1e6:.2f} MHz")
-                                    freq_data['anomaly_freq_mhz'] = (current_freq / 1e6)
-                                    freq_data['signal_strength'] = signal_strength_db
+                                    freq_data = {'anomaly_freq_mhz': (current_freq / 1e6),
+                                                 'signal_strength': signal_strength_db}
+                                    print(f"Anomaly at {current_freq / 1e6:.2f} MHz")
 
                                     # ✅ Get UTC detection time
                                     detection_time = datetime.datetime.utcnow().isoformat() + "Z"  # Add "Z" for UTC format
@@ -323,9 +338,9 @@ def monitor_spectrum_lite(sdr_type, anomaly_model, ham_bands, freq_step, sample_
         mqtt_client.disconnect()
         print(f"MQTT client disconnected")
 
-        sdr.closeStream(stream)
-        sdr.disconnect()
-        sdr.close()
+        if sdr:
+            sdr.closeStream(stream)
+            sdr.close()
         print("Closed SDR device and disconnected from MQTT.")
 
 
@@ -352,7 +367,8 @@ if __name__ == "__main__":
         print(f"Using ML model: {amodel_file}")
 
         # ✅ Call the function with the parsed arguments
-        ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type = read_config(config_file)
+        ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type, min_db, gain_value = read_config(config_file)
+
         anomaly_model = load_anomaly_detection_model(amodel_file)
 
         # Setup MQTT client
@@ -364,7 +380,7 @@ if __name__ == "__main__":
 
         # Monitor the ham bands for anomalies and report results to MQTT
         monitor_spectrum_lite(sdr_type, anomaly_model, ham_bands, freq_step, sample_rate, runs_per_freq,
-                              mqtt_client, mqtt_topic)
+                              min_db, gain_value, mqtt_client, mqtt_topic)
 
     except KeyboardInterrupt:
         sys.exit(0)

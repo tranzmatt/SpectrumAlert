@@ -17,11 +17,12 @@ SoapySDR.SoapySDR_setLogLevel(SoapySDR.SOAPY_SDR_WARNING)  # Suppress INFO messa
 LITE_SAMPLE_SIZE = 128 * 1024  # Reduced sample size for Raspberry Pi
 LITE_SAMPLE_RATE = 1.024e6  # Reduced sample rate for efficiency
 LITE_RUNS_PER_FREQ = 3  # Fewer runs per frequency to save resources
+
+
 # LITE_GAIN = 20                 # Simplified fixed gain for the lite version
 
 # Function to read configuration file
 def read_config(config_file='config.ini'):
-
     config = configparser.ConfigParser()
 
     if not os.path.exists(config_file):
@@ -48,8 +49,10 @@ def read_config(config_file='config.ini'):
     sample_rate = float(config['GENERAL'].get('sample_rate', LITE_SAMPLE_RATE))  # Default to lite sample rate
     runs_per_freq = int(config['GENERAL'].get('runs_per_freq', LITE_RUNS_PER_FREQ))
     sdr_type = config['GENERAL'].get('sdr_type', 'rtlsdr')
+    min_db = float(config['GENERAL']['min_db'])
+    gain_value = float(config['GENERAL'].get('gain_value', 20.0))
 
-    return ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type
+    return ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type, min_db, gain_value
 
 
 # Lite version of feature extraction with only necessary features
@@ -87,11 +90,10 @@ def save_data_to_csv(data, filename, header_written):
 
 
 # Function to gather IQ data and process with reduced features
-def gather_data_lite(sdr_type, ham_bands, freq_step, runs_per_freq, filename, duration_minutes):
+def gather_data_lite(sdr_type, ham_bands, freq_step, runs_per_freq, min_db, gain_value, filename, duration_minutes):
     sdr = None
     try:
-
-        # Enumerate available SDR devices
+            # Enumerate available SDR devices
         device_dicts = [dict(dev) for dev in SoapyDevice.enumerate()]
         device_list = [dev for dev in device_dicts if dev['driver'] == sdr_type]
         device_count = len(device_list)
@@ -103,20 +105,27 @@ def gather_data_lite(sdr_type, ham_bands, freq_step, runs_per_freq, filename, du
             for i, dev in enumerate(device_list):
                 print(f"Device {i}: {dev}")
 
-        # ✅ Assign IDs correctly: `serial` for RTL-SDR, `index` for others
-        if sdr_type == "rtlsdr":
-            device_ids = [dev['serial'] for dev in device_list]  # Use serials for RTL-SDR
-        else:
-            device_ids = [str(i) for i in range(device_count)]  # Use indexes for other SDRs
-
         # ✅ Use `serial` for RTL-SDR, `index` for others
         if sdr_type == "rtlsdr":
+            device_ids = [dev['serial'] for dev in device_list]  # Use serials for RTL-SDR
             sdr = SoapySDR.Device(dict(driver=sdr_type, serial=device_ids[0]))
-            gain_value = 10.0  # Adjust gain manually
+            if sdr is None:
+                raise RuntimeError(f"No available devices of type {sdr_type}")
+                sys.exit(0)
             sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, gain_value)
         else:
+            device_ids = [str(i) for i in range(device_count)]  # Use indexes for other SDRs
             sdr = SoapySDR.Device(dict(driver=sdr_type, index=str(device_ids[0])))
-            sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, 'auto')
+            if sdr is None:
+                raise RuntimeError(f"No available devices of type {sdr_type}")
+                sys.exit(0)
+
+            try:
+                gain_names = sdr.listGains(SoapySDR.SOAPY_SDR_RX, 0)
+                for name in gain_names:
+                    sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, name, gain_value)
+            except Exception as e:
+                print(f"Warning: Failed to set gain: {e}")
 
         header_written = False
         start_time = time.time()
@@ -127,12 +136,14 @@ def gather_data_lite(sdr_type, ham_bands, freq_step, runs_per_freq, filename, du
 
         # Fit PCA on some initial data
         pca_training_data = []
+
+        stream = sdr.setupStream(SoapySDR.SOAPY_SDR_RX, SoapySDR.SOAPY_SDR_CF32)
+        sdr.activateStream(stream)
+
         for band_start, band_end in ham_bands:
 
             sdr.setFrequency(SoapySDR.SOAPY_SDR_RX, 0, band_start)
             buff = np.zeros(LITE_SAMPLE_SIZE, dtype=np.complex64)
-            stream = sdr.setupStream(SoapySDR.SOAPY_SDR_RX, SoapySDR.SOAPY_SDR_CF32)
-            sdr.activateStream(stream)
             sr = sdr.readStream(stream, [buff], len(buff))
 
             if sr.ret > 0:  # ✅ Only process valid samples
@@ -153,8 +164,6 @@ def gather_data_lite(sdr_type, ham_bands, freq_step, runs_per_freq, filename, du
 
                         sdr.setFrequency(SoapySDR.SOAPY_SDR_RX, 0, current_freq)
                         buff = np.zeros(LITE_SAMPLE_SIZE, dtype=np.complex64)
-                        stream = sdr.setupStream(SoapySDR.SOAPY_SDR_RX, SoapySDR.SOAPY_SDR_CF32)
-                        sdr.activateStream(stream)
                         sr = sdr.readStream(stream, [buff], len(buff))
 
                         if sr.ret > 0:  # ✅ Only process valid samples
@@ -181,8 +190,9 @@ def gather_data_lite(sdr_type, ham_bands, freq_step, runs_per_freq, filename, du
         print("Closed SDR device and disconnected from MQTT.")
 
     except KeyboardInterrupt:
-        sdr.closeStream(stream)
-        sdr.close()
+        if sdr:
+            sdr.closeStream(stream)
+            sdr.close()
         print("Closed SDR device and disconnected from MQTT.")
         sys.exit(0)
 
@@ -198,7 +208,6 @@ if __name__ == "__main__":
         parser.add_argument("-o", "--output", type=str, default="collected_data_lite.csv",
                             help="Path to the output file (default: collected_data_lite.csv)")
 
-
         args = parser.parse_args()
 
         # ✅ Extract arguments
@@ -211,10 +220,10 @@ if __name__ == "__main__":
         print(f"Saving to: {output_file}")
 
         # ✅ Call the function with the parsed arguments
-        ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type = read_config(config_file)
+        ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type, min_db, gain_value = read_config(config_file)
 
         # Start data gathering
-        gather_data_lite(sdr_type, ham_bands, freq_step, runs_per_freq, output_file, duration)
+        gather_data_lite(sdr_type, ham_bands, freq_step, runs_per_freq, min_db, gain_value, output_file, duration)
 
     except KeyboardInterrupt:
         sys.exit(0)

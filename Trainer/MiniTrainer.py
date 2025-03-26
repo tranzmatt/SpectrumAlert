@@ -12,32 +12,32 @@ from sklearn.model_selection import train_test_split, cross_val_score, Stratifie
 
 
 # Function to handle loading CSV data into features
-def load_data_from_csv(filename):
-    if not os.path.exists(filename):
-        raise FileNotFoundError(f"File {filename} not found.")
+def load_data_from_csv(local_filename):
+    if not os.path.exists(local_filename):
+        raise FileNotFoundError(f"File {local_filename} not found.")
 
-    features = []
-    with open(filename, 'r') as f:
+    local_features = []
+    with open(local_filename, 'r') as f:
         reader = csv.reader(f)
         header = next(reader)  # Skip the header row
         for row in reader:
-            features.append([float(value) for value in row[1:]])  # Extracting feature data
+            local_features.append([float(value) for value in row[1:]])  # Extracting feature data
 
-    return np.array(features)
+    return np.array(local_features)
 
 
 # Lite version of the RF fingerprinting model
-def train_rf_fingerprinting_model(features):
+def train_rf_fingerprinting_model(local_features):
     # Ensure sufficient data for training
-    if len(features) < 2:
+    if len(local_features) < 2:
         print("Not enough data to train the model.")
         return None, None
 
     # Generate labels for the entire dataset (not just for the training set)
-    labels = [f"Device_{i % 5}" for i in range(len(features))]  # Simulating multiple devices
+    labels = [f"Device_{i % 5}" for i in range(len(local_features))]  # Simulating multiple devices
 
     # Split data into training and testing sets
-    X_train, X_test, y_train, y_test = train_test_split(features, labels, test_size=0.2, random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(local_features, labels, test_size=0.2, random_state=42)
 
     # Count samples per class for cross-validation
     class_counts = Counter(y_train)

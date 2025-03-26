@@ -183,8 +183,9 @@ def read_config(config_file='Trainer/config.ini'):
     sample_rate = float(config['GENERAL']['sample_rate'])
     runs_per_freq = int(config['GENERAL']['runs_per_freq'])
     sdr_type = config['GENERAL'].get('sdr_type', 'rtlsdr')
+    min_db = float(config['GENERAL']['min_db'])
 
-    return (ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type)
+    return ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type, min_db, gain_value
 
 
 # Function to load the pre-trained anomaly detection model
@@ -257,7 +258,8 @@ def calculate_signal_strength(iq_data):
 
 
 def monitor_spectrum(sdr_type, model, anomaly_model, ham_bands, freq_step, sample_rate,
-                     runs_per_freq, mqtt_client, mqtt_topic):
+                     runs_per_freq, min_db, mqtt_client, mqtt_topic):
+
     device_name = get_device_name()
 
     # Enumerate available SDR devices
@@ -285,7 +287,12 @@ def monitor_spectrum(sdr_type, model, anomaly_model, ham_bands, freq_step, sampl
         sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, gain_value)
     else:
         sdr = SoapySDR.Device(dict(driver=sdr_type, index=str(device_ids[0])))
-        sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, 'auto')
+        try:
+            gain_names = sdr.listGains(SoapySDR.SOAPY_SDR_RX, 0)
+            for name in gain_names:
+                sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, name, 20.0)
+        except Exception as e:
+            print(f"Warning: Failed to set gain: {e}")
 
     known_features = []
     similarity_threshold = 0.3  # Threshold to consider a device as similar
@@ -297,6 +304,9 @@ def monitor_spectrum(sdr_type, model, anomaly_model, ham_bands, freq_step, sampl
         # If the model is not yet fitted, you can set a default number or handle it as needed
         expected_num_features = 9  # Default to the current number of features if unknown
 
+    stream = sdr.setupStream(SoapySDR.SOAPY_SDR_RX, SoapySDR.SOAPY_SDR_CF32)
+    sdr.activateStream(stream)
+
     while True:
         for band_start, band_end in ham_bands:
             current_freq = band_start
@@ -304,14 +314,15 @@ def monitor_spectrum(sdr_type, model, anomaly_model, ham_bands, freq_step, sampl
                 for _ in range(runs_per_freq):
                     sdr.setFrequency(SoapySDR.SOAPY_SDR_RX, 0, current_freq)
                     buff = np.zeros(128 * 1024, dtype=np.complex64)
-                    stream = sdr.setupStream(SoapySDR.SOAPY_SDR_RX, SoapySDR.SOAPY_SDR_CF32)
-                    sdr.activateStream(stream)
                     sr = sdr.readStream(stream, [buff], len(buff))
 
                     if sr.ret > 0:  # ✅ Only process valid samples
                         iq_samples = buff[:sr.ret]  # ✅ Extract only valid IQ samples
                         features = extract_features(iq_samples, target_num_features=expected_num_features)
                         signal_strength_db = calculate_signal_strength(iq_samples)
+
+                        if signal_strength_db < min_db:
+                            continue
 
                         # Detect anomalies
                         is_anomaly = anomaly_model.predict([features])[0] == -1
@@ -392,7 +403,7 @@ if __name__ == "__main__":
         amodel_file = args.amodel
         rf_model_file = args.rfmodel
 
-        ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type = read_config(config_file)
+        ham_bands, freq_step, sample_rate, runs_per_freq, sdr_type, min_db, gain_value = read_config(config_file)
 
         # Load the pre-trained RF fingerprinting and anomaly detection models
         anomaly_model = load_anomaly_detection_model(amodel_file)
@@ -407,7 +418,7 @@ if __name__ == "__main__":
 
         # Monitor the ham bands for anomalies and report results to MQTT
         monitor_spectrum(sdr_type, rf_model, anomaly_model, ham_bands, freq_step, sample_rate, runs_per_freq,
-                         mqtt_client, mqtt_topic)
+                         min_db, gain_value, mqtt_client, mqtt_topic)
 
     except KeyboardInterrupt:
         print("Monitoring stopped by user.")
